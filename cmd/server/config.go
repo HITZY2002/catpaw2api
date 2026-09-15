@@ -25,14 +25,14 @@ type Config struct {
 	} `json:"cooldown"`
 
 	Quota struct {
-		Enabled            bool   `json:"enabled"`
-		PollMinutes        int    `json:"poll_minutes"`
-		ApplyThreshold     int64  `json:"apply_threshold"`
-		ApplyMethod        string `json:"apply_method"`
-		ApplyCooldownHour  int    `json:"apply_cooldown_hours"`
-		RegisterOnStart    bool   `json:"register_on_start"`
-		AutoRenew          bool   `json:"auto_renew"`
-		RenewThresholdHours int   `json:"renew_threshold_hours"` // 默认 6
+		Enabled             bool   `json:"enabled"`
+		PollMinutes         int    `json:"poll_minutes"`
+		ApplyThreshold      int64  `json:"apply_threshold"`
+		ApplyMethod         string `json:"apply_method"`
+		ApplyCooldownHour   int    `json:"apply_cooldown_hours"`
+		RegisterOnStart     bool   `json:"register_on_start"`
+		AutoRenew           bool   `json:"auto_renew"`
+		RenewThresholdHours int    `json:"renew_threshold_hours"` // 默认 6
 	} `json:"quota"`
 
 	Upstream struct {
