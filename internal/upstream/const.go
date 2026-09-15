@@ -44,11 +44,11 @@ const (
 
 	// 真实模型名（逆向自 app.asar，已在 free 计划账号上实测全部返回正常回复）。
 	// 这 7 个是 /api/agent/maas/model-types 在 tenant=CatDesk,scene=CATX_APP,env=EXTERNAL 下返回的完整列表。
-	ExactModelAuto       = "auto"
-	ExactModelLongCat2   = "LongCat-2.0" // 限时免费
+	ExactModelAuto            = "auto"
+	ExactModelLongCat2        = "LongCat-2.0" // 限时免费
 	ExactModelDeepseekV4Flash = "deepseek-v4-flash"
 	ExactModelDeepseekV4Pro   = "deepseek-v4-pro"
-	ExactModelGLM52      = "glm-5.2"
-	ExactModelMiniMaxM3  = "MiniMax-M3"
-	ExactModelKimiK3     = "kimi-k3"
+	ExactModelGLM52           = "glm-5.2"
+	ExactModelMiniMaxM3       = "MiniMax-M3"
+	ExactModelKimiK3          = "kimi-k3"
 )
