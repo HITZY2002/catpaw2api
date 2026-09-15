@@ -38,10 +38,10 @@ type Config struct {
 	ApplyCooldown   time.Duration // 两次申请最小间隔，默认 6h
 	RegisterOnStart bool          // 启动时领取注册奖励
 	// AutoRenew token 自动续期：剩余低于 RenewThreshold 时发起 OAuth。
-	AutoRenew       bool          // 是否启用自动续期（与额度 watchdog 独立）
-	RenewThreshold  time.Duration // 触发续期的剩余时间阈值，默认 6h
-	RenewWaitMax    time.Duration // 单次续期轮询最长等待，默认 15m
-	AuthDir         string        // auths 目录（续期成功后落盘）
+	AutoRenew      bool          // 是否启用自动续期（与额度 watchdog 独立）
+	RenewThreshold time.Duration // 触发续期的剩余时间阈值，默认 6h
+	RenewWaitMax   time.Duration // 单次续期轮询最长等待，默认 15m
+	AuthDir        string        // auths 目录（续期成功后落盘）
 }
 
 // Scheduler 定时任务。
