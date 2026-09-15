@@ -25,15 +25,14 @@ type Config struct {
 	} `json:"cooldown"`
 
 	Quota struct {
-		Enabled           bool   `json:"enabled"`
-		PollMinutes       int    `json:"poll_minutes"`
-		ApplyThreshold    int64  `json:"apply_threshold"`
-		ApplyMethod       string `json:"apply_method"`
-		ApplyCooldownHour int    `json:"apply_cooldown_hours"`
-		RegisterOnStart   bool   `json:"register_on_start"`
-		// AutoRenew token 自动续期：剩余 < RenewThresholdHours 时发起 OAuth。
-		AutoRenew          bool `json:"auto_renew"`
-		RenewThresholdHours int  `json:"renew_threshold_hours"` // 默认 6
+		Enabled            bool   `json:"enabled"`
+		PollMinutes        int    `json:"poll_minutes"`
+		ApplyThreshold     int64  `json:"apply_threshold"`
+		ApplyMethod        string `json:"apply_method"`
+		ApplyCooldownHour  int    `json:"apply_cooldown_hours"`
+		RegisterOnStart    bool   `json:"register_on_start"`
+		AutoRenew          bool   `json:"auto_renew"`
+		RenewThresholdHours int   `json:"renew_threshold_hours"` // 默认 6
 	} `json:"quota"`
 
 	Upstream struct {
@@ -201,8 +200,13 @@ func (c *Config) normalize() error {
 	if !strings.Contains(c.Listen, ":") {
 		c.Listen = ":" + c.Listen
 	}
-	if _, _, err := net.SplitHostPort(c.Listen); err != nil {
+	if _, port, err := net.SplitHostPort(c.Listen); err != nil {
 		return fmt.Errorf("listen %q: %w", c.Listen, err)
+	} else {
+		n, convErr := strconv.Atoi(port)
+		if convErr != nil || n < 1 || n > 65535 {
+			return fmt.Errorf("listen %q: port must be numeric in range 1..65535", c.Listen)
+		}
 	}
 	if strings.TrimSpace(c.AuthDir) == "" {
 		return fmt.Errorf("auth_dir must not be empty")
