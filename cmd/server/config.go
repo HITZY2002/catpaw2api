@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"net"
 	"os"
 	"strconv"
 	"strings"
@@ -44,10 +45,10 @@ type Config struct {
 	ErrCooldownDur time.Duration
 }
 
-// Default 默认配置。
+// Default 默认配置。裸机默认只监听 loopback；Docker 由 compose 显式覆盖为 :7867。
 func Default() *Config {
 	c := &Config{
-		Listen:       ":7865",
+		Listen:       "127.0.0.1:7867",
 		AuthDir:      "./auths",
 		StateFile:    "./data/state.json",
 		DefaultModel: "glm-5.2",
@@ -61,8 +62,8 @@ func Default() *Config {
 	c.Quota.ApplyMethod = "register"
 	c.Quota.ApplyCooldownHour = 6
 	c.Quota.RegisterOnStart = true
-	c.Quota.AutoRenew = true              // 默认开启自动续期
-	c.Quota.RenewThresholdHours = 6       // 剩余 6h 触发续期
+	c.Quota.AutoRenew = true
+	c.Quota.RenewThresholdHours = 6
 	c.Upstream.TimeoutSeconds = 120
 	return c
 }
@@ -80,15 +81,17 @@ func Load(path string) (*Config, error) {
 			return nil, fmt.Errorf("parse config: %w", err)
 		}
 	}
-	applyEnv(c)
+	if err := applyEnv(c); err != nil {
+		return nil, err
+	}
 	if err := c.normalize(); err != nil {
 		return nil, err
 	}
 	return c, nil
 }
 
-func applyEnv(c *Config) {
-	if v := os.Getenv("CP2A_API_KEY"); v != "" {
+func applyEnv(c *Config) error {
+	if v, ok := os.LookupEnv("CP2A_API_KEY"); ok {
 		c.APIKey = v
 	}
 	if v := os.Getenv("CP2A_LISTEN"); v != "" {
@@ -97,47 +100,84 @@ func applyEnv(c *Config) {
 	if v := os.Getenv("CP2A_AUTH_DIR"); v != "" {
 		c.AuthDir = v
 	}
-	if v := os.Getenv("CP2A_STATE_FILE"); v != "" {
+	if v, ok := os.LookupEnv("CP2A_STATE_FILE"); ok {
 		c.StateFile = v
 	}
 	if v := os.Getenv("CP2A_DEFAULT_MODEL"); v != "" {
 		c.DefaultModel = v
 	}
 	if v := os.Getenv("CP2A_QUOTA_ENABLED"); v != "" {
-		c.Quota.Enabled = v == "1" || strings.EqualFold(v, "true")
+		b, err := strconv.ParseBool(v)
+		if err != nil {
+			return fmt.Errorf("CP2A_QUOTA_ENABLED: %w", err)
+		}
+		c.Quota.Enabled = b
 	}
 	if v := os.Getenv("CP2A_QUOTA_POLL_MINUTES"); v != "" {
-		if n, err := strconv.Atoi(v); err == nil {
-			c.Quota.PollMinutes = n
+		n, err := strconv.Atoi(v)
+		if err != nil {
+			return fmt.Errorf("CP2A_QUOTA_POLL_MINUTES: %w", err)
 		}
+		c.Quota.PollMinutes = n
 	}
 	if v := os.Getenv("CP2A_QUOTA_THRESHOLD"); v != "" {
-		if n, err := strconv.ParseInt(v, 10, 64); err == nil {
-			c.Quota.ApplyThreshold = n
+		n, err := strconv.ParseInt(v, 10, 64)
+		if err != nil {
+			return fmt.Errorf("CP2A_QUOTA_THRESHOLD: %w", err)
 		}
+		c.Quota.ApplyThreshold = n
 	}
 	if v := os.Getenv("CP2A_QUOTA_METHOD"); v != "" {
 		c.Quota.ApplyMethod = v
 	}
 	if v := os.Getenv("CP2A_QUOTA_COOLDOWN_HOURS"); v != "" {
-		if n, err := strconv.Atoi(v); err == nil {
-			c.Quota.ApplyCooldownHour = n
+		n, err := strconv.Atoi(v)
+		if err != nil {
+			return fmt.Errorf("CP2A_QUOTA_COOLDOWN_HOURS: %w", err)
 		}
+		c.Quota.ApplyCooldownHour = n
 	}
 	if v := os.Getenv("CP2A_QUOTA_REGISTER_ON_START"); v != "" {
-		c.Quota.RegisterOnStart = v == "1" || strings.EqualFold(v, "true")
+		b, err := strconv.ParseBool(v)
+		if err != nil {
+			return fmt.Errorf("CP2A_QUOTA_REGISTER_ON_START: %w", err)
+		}
+		c.Quota.RegisterOnStart = b
 	}
 	if v := os.Getenv("CP2A_QUOTA_AUTO_RENEW"); v != "" {
-		c.Quota.AutoRenew = v == "1" || strings.EqualFold(v, "true")
+		b, err := strconv.ParseBool(v)
+		if err != nil {
+			return fmt.Errorf("CP2A_QUOTA_AUTO_RENEW: %w", err)
+		}
+		c.Quota.AutoRenew = b
 	}
 	if v := os.Getenv("CP2A_QUOTA_RENEW_THRESHOLD_HOURS"); v != "" {
-		if n, err := strconv.Atoi(v); err == nil {
-			c.Quota.RenewThresholdHours = n
+		n, err := strconv.Atoi(v)
+		if err != nil {
+			return fmt.Errorf("CP2A_QUOTA_RENEW_THRESHOLD_HOURS: %w", err)
 		}
+		c.Quota.RenewThresholdHours = n
 	}
+	if v := os.Getenv("CP2A_UPSTREAM_TIMEOUT_SECONDS"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil {
+			return fmt.Errorf("CP2A_UPSTREAM_TIMEOUT_SECONDS: %w", err)
+		}
+		c.Upstream.TimeoutSeconds = n
+	}
+	return nil
 }
 
 func (c *Config) normalize() error {
+	c.APIKey = strings.TrimSpace(c.APIKey)
+	if c.APIKey == "" {
+		return fmt.Errorf("CP2A_API_KEY is required; generate one with `openssl rand -hex 24`")
+	}
+	switch strings.ToLower(c.APIKey) {
+	case "changeme", "change-me", "your-api-key-here", "dummy-key-for-catpaw":
+		return fmt.Errorf("CP2A_API_KEY uses an insecure example value; generate a unique random key")
+	}
+
 	var err error
 	if c.SoftRateDur, err = time.ParseDuration(c.Cooldown.SoftRate); err != nil {
 		return fmt.Errorf("cooldown.soft_rate: %w", err)
@@ -154,11 +194,18 @@ func (c *Config) normalize() error {
 	if c.DefaultModel == "" {
 		c.DefaultModel = "auto"
 	}
+	c.Listen = strings.TrimSpace(c.Listen)
 	if c.Listen == "" {
-		c.Listen = ":7865"
+		c.Listen = "127.0.0.1:7867"
 	}
-	if !strings.HasPrefix(c.Listen, ":") && !strings.Contains(c.Listen, ":") {
+	if !strings.Contains(c.Listen, ":") {
 		c.Listen = ":" + c.Listen
+	}
+	if _, _, err := net.SplitHostPort(c.Listen); err != nil {
+		return fmt.Errorf("listen %q: %w", c.Listen, err)
+	}
+	if strings.TrimSpace(c.AuthDir) == "" {
+		return fmt.Errorf("auth_dir must not be empty")
 	}
 	if c.Quota.ApplyThreshold <= 0 {
 		c.Quota.ApplyThreshold = 50
@@ -174,6 +221,11 @@ func (c *Config) normalize() error {
 	}
 	if c.Quota.ApplyMethod == "" {
 		c.Quota.ApplyMethod = "register"
+	}
+	switch c.Quota.ApplyMethod {
+	case "register", "campaign", "none":
+	default:
+		return fmt.Errorf("quota.apply_method must be register, campaign, or none, got %q", c.Quota.ApplyMethod)
 	}
 	return nil
 }
