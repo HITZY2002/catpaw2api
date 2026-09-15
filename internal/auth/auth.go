@@ -29,24 +29,44 @@ type Auth struct {
 // New 构造 Auth（登录落盘用）。
 func New(uid, userName, token string) *Auth {
 	return &Auth{
-		UID:         uid,
+		UID:         strings.TrimSpace(uid),
 		UserName:    userName,
-		AccessToken: token,
+		AccessToken: strings.TrimSpace(token),
 		UpdatedAt:   time.Now().Unix(),
 	}
 }
 
-// FileName 返回 auth 文件名。
+// FileName 返回安全的 auth 文件名。UID 永远不会直接成为路径片段。
 func (a *Auth) FileName() string {
-	id := strings.ReplaceAll(a.UID, string(filepath.Separator), "_")
-	if id == "" {
-		id = "unknown"
+	return fmt.Sprintf("catpaw-%s.json", safeID(a.UID))
+}
+
+func safeID(uid string) string {
+	uid = strings.TrimSpace(uid)
+	var b strings.Builder
+	for _, r := range uid {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9', r == '-', r == '_':
+			b.WriteRune(r)
+		default:
+			b.WriteByte('_')
+		}
+		if b.Len() >= 128 {
+			break
+		}
 	}
-	return fmt.Sprintf("catpaw-%s.json", id)
+	out := strings.Trim(b.String(), "_-")
+	if out == "" || out == "." || out == ".." {
+		return "unknown"
+	}
+	return out
 }
 
 // Token 返回 access token（并发安全快照）。
 func (a *Auth) Token() string {
+	if a == nil {
+		return ""
+	}
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	return a.AccessToken
@@ -54,6 +74,9 @@ func (a *Auth) Token() string {
 
 // Age 返回 token 已存在时长。
 func (a *Auth) Age() time.Duration {
+	if a == nil {
+		return 0
+	}
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	if a.UpdatedAt == 0 {
@@ -64,6 +87,9 @@ func (a *Auth) Age() time.Duration {
 
 // ExpiresAt 返回 token 预计过期时间（UpdatedAt + 72h；UpdatedAt 缺失时返回零值）。
 func (a *Auth) ExpiresAt() time.Time {
+	if a == nil {
+		return time.Time{}
+	}
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	if a.UpdatedAt == 0 {
@@ -74,6 +100,9 @@ func (a *Auth) ExpiresAt() time.Time {
 
 // Remaining 返回 token 剩余有效期（<=0 表示已过期；UpdatedAt 缺失时返回 TokenLifetime）。
 func (a *Auth) Remaining() time.Duration {
+	if a == nil {
+		return 0
+	}
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	if a.UpdatedAt == 0 {
@@ -84,7 +113,7 @@ func (a *Auth) Remaining() time.Duration {
 
 // Expired 报告 token 是否已过期（按 72h 推算，不等上游 401）。
 func (a *Auth) Expired() bool {
-	return a.Remaining() <= 0
+	return a == nil || a.Remaining() <= 0
 }
 
 // ExpiringSoon 报告 token 是否将在 within 内过期。
@@ -95,15 +124,26 @@ func (a *Auth) ExpiringSoon(within time.Duration) bool {
 
 // Save 原子写回 auth 文件（0600）。
 func (a *Auth) Save() error {
+	if a == nil {
+		return fmt.Errorf("auth: nil credential")
+	}
 	a.mu.Lock()
 	defer a.mu.Unlock()
+	if err := validateLocked(a); err != nil {
+		return err
+	}
 	return saveLocked(a.path, a)
 }
 
 // SetPath 设置文件路径（LoadDir 时内部调用）。
-func (a *Auth) SetPath(p string) { a.path = p }
+func (a *Auth) SetPath(p string) {
+	if a != nil {
+		a.path = p
+	}
+}
 
-// LoadDir 加载 auths 目录下全部 catpaw-*.json。
+// LoadDir 加载 auths 目录下全部 catpaw-*.json。损坏/缺 UID 的 credential fail closed，
+// 避免静默生成空账号或让同一 UID 出现两份可轮转状态。
 func LoadDir(dir string) ([]*Auth, error) {
 	entries, err := os.ReadDir(dir)
 	if err != nil {
@@ -113,6 +153,7 @@ func LoadDir(dir string) ([]*Auth, error) {
 		return nil, err
 	}
 	var out []*Auth
+	seen := map[string]string{}
 	for _, e := range entries {
 		if e.IsDir() || !strings.HasPrefix(e.Name(), "catpaw-") || !strings.HasSuffix(e.Name(), ".json") {
 			continue
@@ -126,9 +167,18 @@ func LoadDir(dir string) ([]*Auth, error) {
 		if err := json.Unmarshal(raw, &a); err != nil {
 			return nil, fmt.Errorf("parse %s: %w", e.Name(), err)
 		}
+		a.UID = strings.TrimSpace(a.UID)
+		a.AccessToken = strings.TrimSpace(a.AccessToken)
 		if a.AccessToken == "" {
 			continue
 		}
+		if a.UID == "" {
+			return nil, fmt.Errorf("parse %s: missing uid", e.Name())
+		}
+		if previous, ok := seen[a.UID]; ok {
+			return nil, fmt.Errorf("duplicate uid %q in %s and %s", a.UID, previous, e.Name())
+		}
+		seen[a.UID] = e.Name()
 		a.path = p
 		out = append(out, &a)
 	}
@@ -138,11 +188,31 @@ func LoadDir(dir string) ([]*Auth, error) {
 
 // SaveNew 把新账号写入 auths 目录。
 func SaveNew(dir string, a *Auth) error {
+	if a == nil {
+		return fmt.Errorf("auth: nil credential")
+	}
+	a.mu.Lock()
+	if err := validateLocked(a); err != nil {
+		a.mu.Unlock()
+		return err
+	}
+	filename := a.FileName()
+	a.mu.Unlock()
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return err
 	}
-	a.path = filepath.Join(dir, a.FileName())
+	a.path = filepath.Join(dir, filename)
 	return a.Save()
+}
+
+func validateLocked(a *Auth) error {
+	if strings.TrimSpace(a.UID) == "" {
+		return fmt.Errorf("auth: empty uid")
+	}
+	if strings.TrimSpace(a.AccessToken) == "" {
+		return fmt.Errorf("auth: empty access token")
+	}
+	return nil
 }
 
 func saveLocked(path string, v any) error {
@@ -154,8 +224,12 @@ func saveLocked(path string, v any) error {
 		return err
 	}
 	tmp := path + ".tmp"
+	defer os.Remove(tmp)
 	if err := os.WriteFile(tmp, raw, 0o600); err != nil {
 		return err
 	}
-	return os.Rename(tmp, path)
+	if err := os.Rename(tmp, path); err != nil {
+		return err
+	}
+	return os.Chmod(path, 0o600)
 }
