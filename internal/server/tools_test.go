@@ -60,7 +60,7 @@ func TestNormalizeTools(t *testing.T) {
 
 func TestToolsActive(t *testing.T) {
 	req := &chatRequest{
-		Tools: []map[string]any{{"type": "function", "function": map[string]any{"name": "f"}}},
+		Tools:      []map[string]any{{"type": "function", "function": map[string]any{"name": "f"}}},
 		ToolChoice: toolChoiceOpenAI{Mode: "auto"},
 	}
 	if !toolsActive(req) {
