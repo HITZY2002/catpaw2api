@@ -534,13 +534,13 @@ type historyContent struct {
 }
 
 type historyItem struct {
-	Type       string         `json:"type"`
-	Status     int            `json:"status"`
-	Finished   bool           `json:"finished"`
-	RoundID    any            `json:"roundId"`
-	CreateTime any            `json:"createTime"`
+	Type       string           `json:"type"`
+	Status     int              `json:"status"`
+	Finished   bool             `json:"finished"`
+	RoundID    any              `json:"roundId"`
+	CreateTime any              `json:"createTime"`
 	Content    []historyContent `json:"content"`
-	TotalUsage map[string]any `json:"totalUsage"`
+	TotalUsage map[string]any   `json:"totalUsage"`
 }
 
 func historyRound(v any) (float64, bool) {
