@@ -26,6 +26,10 @@ const (
 )
 
 // Account 一个上游账号。
+//
+// Name/UID/UserName/Auth/Client 在账号发布到 Pool 后视为稳定引用：热续期或 reload
+// 不替换 Auth 指针，而是通过 auth.Auth.ReplaceFrom 原子更新其内部凭证。这样运行中的
+// 请求即使持有 *Account，也不会与 credential pointer replacement 形成数据竞争。
 type Account struct {
 	Name         string `json:"name"` // 默认 = UID
 	UID          string `json:"uid"`
@@ -173,29 +177,39 @@ func (p *Pool) List() []map[string]any {
 	return out
 }
 
-// AddAccount 动态加入账号；同 UID 替换 token，同时清掉旧 token 遗留的禁用/冷却/错误状态，保留真实余额。
+// AddAccount 动态加入账号；同 UID 原地替换 token，同时清掉旧 token 遗留的
+// 禁用/冷却/错误状态并保留真实余额。已发布 Account.Auth 指针永不替换。
 func (p *Pool) AddAccount(a *auth.Auth) *Account {
 	if a == nil || a.UID == "" || a.Token() == "" {
 		return nil
 	}
 	p.mu.Lock()
 	for _, existing := range p.accounts {
-		if existing.UID == a.UID {
-			existing.mu.Lock()
-			existing.Auth = a
-			existing.UserName = a.UserName
-			existing.disabled = false
-			existing.disabledReason = ""
-			existing.lastErr = ""
-			existing.errCount = 0
-			existing.coolUntil = time.Time{}
-			existing.coolKind = CoolSoft
-			existing.lastValidated = time.Time{}
-			existing.mu.Unlock()
-			p.mu.Unlock()
-			p.saveState()
-			return existing
+		if existing.UID != a.UID {
+			continue
 		}
+		if existing.Auth == nil {
+			p.mu.Unlock()
+			log.Printf("pool account uid=%s has nil published auth; refusing unsafe hot replacement", a.UID)
+			return nil
+		}
+		if err := existing.Auth.ReplaceFrom(a); err != nil {
+			p.mu.Unlock()
+			log.Printf("pool account uid=%s credential replacement failed: %v", a.UID, err)
+			return nil
+		}
+		existing.mu.Lock()
+		existing.disabled = false
+		existing.disabledReason = ""
+		existing.lastErr = ""
+		existing.errCount = 0
+		existing.coolUntil = time.Time{}
+		existing.coolKind = CoolSoft
+		existing.lastValidated = time.Time{}
+		existing.mu.Unlock()
+		p.mu.Unlock()
+		p.saveState()
+		return existing
 	}
 	acct := newAccount(a, p.cfg.UpstreamTimeout)
 	p.accounts = append(p.accounts, acct)
@@ -205,7 +219,8 @@ func (p *Pool) AddAccount(a *auth.Auth) *Account {
 	return acct
 }
 
-// SyncToDir 用磁盘 auths 全量对齐内存池（重载）。
+// SyncToDir 用磁盘 auths 全量对齐内存池（重载）。同 UID 账号保持原 Account/Auth
+// 对象地址，只原子替换 token；被删除的 UID 从下一次 pool 快照中移除。
 func (p *Pool) SyncToDir(auths []*auth.Auth) {
 	p.mu.Lock()
 	byUID := map[string]*Account{}
@@ -218,9 +233,19 @@ func (p *Pool) SyncToDir(auths []*auth.Auth) {
 			continue
 		}
 		if existing, ok := byUID[a.UID]; ok {
+			if existing.Auth == nil {
+				log.Printf("pool reload uid=%s has nil published auth; rebuilding account", a.UID)
+				next = append(next, newAccount(a, p.cfg.UpstreamTimeout))
+				delete(byUID, a.UID)
+				continue
+			}
+			if err := existing.Auth.ReplaceFrom(a); err != nil {
+				log.Printf("pool reload uid=%s credential replacement failed: %v", a.UID, err)
+				next = append(next, existing)
+				delete(byUID, a.UID)
+				continue
+			}
 			existing.mu.Lock()
-			existing.Auth = a
-			existing.UserName = a.UserName
 			existing.lastValidated = time.Time{}
 			existing.mu.Unlock()
 			next = append(next, existing)
@@ -280,7 +305,7 @@ func (p *Pool) Validate(a *Account) (bool, error) {
 	}
 	a.mu.Unlock()
 
-	ok, err := a.Client.Ping(context.Background(), a.Auth.Token())
+	ok, err := a.Client.Ping(context.Background(), a.Token())
 	if err != nil {
 		// Validation endpoint 暂时不可达时采用 best-effort：不改变持久状态，由真实请求继续判定。
 		return false, err
