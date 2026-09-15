@@ -54,6 +54,48 @@ func TestPollAssistantUsesLatestRoundAndWaitsForCompletion(t *testing.T) {
 	}
 }
 
+func TestPollAssistantWaitsWhenLatestUserHasNoAssistantYet(t *testing.T) {
+	oldDirect := DirectHost
+	defer func() { DirectHost = oldDirect }()
+
+	var calls int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		w.Header().Set("Content-Type", "application/json")
+		if calls == 1 {
+			_, _ = w.Write([]byte(`{"unifyCode":0,"code":0,"msg":"成功","data":{"items":[` +
+				`{"type":"user","roundId":1,"status":1,"finished":true,"totalUsage":{"total_tokens":10},"content":[{"type":"text","text":"q1"}]},` +
+				`{"type":"assistant","roundId":1,"status":1,"finished":true,"content":[{"type":"text","text":"old answer"}]},` +
+				`{"type":"user","roundId":2,"status":1,"finished":true,"totalUsage":{"total_tokens":20},"content":[{"type":"text","text":"q2"}]}` +
+				`]},"success":true}`))
+			return
+		}
+		_, _ = w.Write([]byte(`{"unifyCode":0,"code":0,"msg":"成功","data":{"items":[` +
+			`{"type":"user","roundId":1,"status":1,"finished":true,"totalUsage":{"total_tokens":10},"content":[{"type":"text","text":"q1"}]},` +
+			`{"type":"assistant","roundId":1,"status":1,"finished":true,"content":[{"type":"text","text":"old answer"}]},` +
+			`{"type":"user","roundId":2,"status":1,"finished":true,"totalUsage":{"total_tokens":20},"content":[{"type":"text","text":"q2"}]},` +
+			`{"type":"assistant","roundId":2,"status":1,"finished":true,"content":[{"type":"text","text":"new answer"}]}` +
+			`]},"success":true}`))
+	}))
+	defer srv.Close()
+	DirectHost = srv.URL
+
+	c := New(2 * time.Second)
+	res, err := c.PollAssistant(context.Background(), "tok", "uid", "conv", PollOpts{
+		Interval: 5 * time.Millisecond,
+		Timeout:  time.Second,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if calls < 2 {
+		t.Fatalf("poll count=%d, expected wait for round-2 assistant", calls)
+	}
+	if res.Content != "new answer" {
+		t.Fatalf("content=%q, old assistant was returned before current round existed", res.Content)
+	}
+}
+
 func TestPollAssistantPrefersRoundMetadataOverArrayOrder(t *testing.T) {
 	oldDirect := DirectHost
 	defer func() { DirectHost = oldDirect }()
