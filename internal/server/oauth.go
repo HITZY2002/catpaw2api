@@ -69,8 +69,6 @@ func (s *oauthStore) gcLocked() {
 	}
 }
 
-func newSessionID() string { return randHex(32) }
-
 // adminOAuthStart 发起 Passport 授权，返回浏览器登录 URL。
 func (h *Handler) adminOAuthStart(w http.ResponseWriter, r *http.Request) {
 	if h.cfg.AuthDir == "" {
@@ -83,10 +81,25 @@ func (h *Handler) adminOAuthStart(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadGateway, map[string]any{"ok": false, "message": "login-config 失败: " + err.Error()})
 		return
 	}
-	state := randHex(32)
-	sid := randHex(32)
+
+	state, err := secureRandHex(32)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]any{"ok": false, "message": "生成 OAuth state 失败"})
+		return
+	}
+	sid, err := secureRandHex(32)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]any{"ok": false, "message": "生成 OAuth sid 失败"})
+		return
+	}
+	id, err := secureRandHex(32)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]any{"ok": false, "message": "生成 OAuth session_id 失败"})
+		return
+	}
+
 	u, err := url.Parse(loginEntry)
-	if err != nil || u.Scheme == "" || u.Host == "" {
+	if err != nil || u.Scheme == "" || u.Host == "" || (u.Scheme != "https" && u.Scheme != "http") {
 		writeJSON(w, http.StatusBadGateway, map[string]any{"ok": false, "message": "解析 loginEntryUrl 失败"})
 		return
 	}
@@ -97,7 +110,6 @@ func (h *Handler) adminOAuthStart(w http.ResponseWriter, r *http.Request) {
 	q.Set("sid", sid)
 	u.RawQuery = q.Encode()
 
-	id := newSessionID()
 	h.oauth.put(&oauthSession{
 		ID:        id,
 		SID:       sid,
@@ -181,21 +193,26 @@ func (h *Handler) adminOAuthPoll(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusInternalServerError, map[string]any{"ok": false, "status": "error", "message": "账号池未初始化"})
 		return
 	}
-	h.cfg.Pool.AddAccount(a)
+	if updated := h.cfg.Pool.AddAccount(a); updated == nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]any{
+			"ok": false, "status": "error", "message": "凭证已落盘，但账号池热加载失败；请执行 reload 或重启服务",
+		})
+		return
+	}
 
 	// 非阻塞刷余额 + 尝试 register；请求已完成后使用独立的短超时 context。
-	go func(authCopy *auth.Auth) {
-		acct := h.cfg.Pool.Get(authCopy.UID)
+	go func(uid string) {
+		acct := h.cfg.Pool.Get(uid)
 		if acct == nil {
 			return
 		}
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
-		_, _ = acct.Client.Register(ctx, authCopy.Token())
-		if bal, err := acct.Client.CreditBalance(ctx, authCopy.Token()); err == nil {
-			h.cfg.Pool.SetBalance(authCopy.UID, upstream.ParseCredits(bal))
+		_, _ = acct.Client.Register(ctx, acct.Token())
+		if bal, err := acct.Client.CreditBalance(ctx, acct.Token()); err == nil {
+			h.cfg.Pool.SetBalance(uid, upstream.ParseCredits(bal))
 		}
-	}(a)
+	}(a.UID)
 
 	h.oauth.del(req.SessionID)
 	writeJSON(w, http.StatusOK, map[string]any{
