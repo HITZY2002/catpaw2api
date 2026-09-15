@@ -38,17 +38,35 @@ func TestAdminEnablePreservesBalance(t *testing.T) {
 	}
 }
 
-func TestAdminEnableMissingAccountReturns404(t *testing.T) {
+func TestAdminExplicitMissingAccountReturns404(t *testing.T) {
 	p, err := pool.New(nil, pool.Config{}, "")
 	if err != nil {
 		t.Fatal(err)
 	}
 	h := NewHandler(Config{Pool: p, APIKey: "test-key"})
-	req := httptest.NewRequest(http.MethodPost, "/admin/api/accounts/enable", strings.NewReader(`{"uid":"missing"}`))
-	rec := httptest.NewRecorder()
-	h.adminEnable(rec, req)
 
-	if rec.Code != http.StatusNotFound {
-		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+	cases := []struct {
+		name string
+		path string
+		fn   func(http.ResponseWriter, *http.Request)
+	}{
+		{name: "enable", path: "/admin/api/accounts/enable", fn: h.adminEnable},
+		{name: "disable", path: "/admin/api/accounts/disable", fn: h.adminDisable},
+		{name: "clear cooldown", path: "/admin/api/accounts/clear-cooldown", fn: h.adminClearCooldown},
+		{name: "unfreeze", path: "/admin/api/accounts/unfreeze", fn: h.adminUnfreeze},
+		{name: "credits", path: "/admin/api/credits", fn: h.adminCredits},
+		{name: "keepalive", path: "/admin/api/keepalive", fn: h.adminKeepalive},
+		{name: "apply", path: "/admin/api/checkin", fn: h.adminApply},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodPost, tc.path, strings.NewReader(`{"uid":"missing"}`))
+			rec := httptest.NewRecorder()
+			tc.fn(rec, req)
+			if rec.Code != http.StatusNotFound {
+				t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+			}
+		})
 	}
 }
