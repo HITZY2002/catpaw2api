@@ -65,6 +65,7 @@ type Pool struct {
 	cfg      Config
 	state    string
 	mu       sync.Mutex
+	stateMu  sync.Mutex // 串行化 state.json 的 snapshot/write/rename，避免并发 tmp 文件互相覆盖
 	accounts []*Account
 }
 
@@ -591,6 +592,11 @@ func (p *Pool) saveState() {
 	if p.state == "" {
 		return
 	}
+	// 所有状态落盘从取快照到 rename 全程串行，避免多个 goroutine 同时写同一个
+	// state.json.tmp 或旧快照最后覆盖新状态。
+	p.stateMu.Lock()
+	defer p.stateMu.Unlock()
+
 	accounts := p.Accounts()
 	out := make([]stateEntry, 0, len(accounts))
 	for _, a := range accounts {
