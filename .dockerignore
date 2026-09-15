@@ -1,5 +1,13 @@
 auths
 data
 .git
+.github
+.env
+.env.*
+config.json
+*.key
+*.pem
 *.exe
+*.bak
+*.backup*
 credit-web.js
