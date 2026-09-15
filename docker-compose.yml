@@ -4,11 +4,18 @@ services:
     container_name: catpaw2api
     restart: unless-stopped
     ports:
-      - "7867:7867"
+      - "${CP2A_BIND_ADDR:-127.0.0.1}:7867:7867"
     environment:
-      CP2A_API_KEY: ${CP2A_API_KEY:-change-me}
+      CP2A_API_KEY: ${CP2A_API_KEY:?set CP2A_API_KEY in .env or shell}
+      CP2A_LISTEN: ":7867"
       TZ: Asia/Shanghai
     volumes:
       - ./auths:/app/auths
       - ./data:/app/data
       - ./config.json:/app/config.json:ro
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "-", "http://127.0.0.1:7867/healthz"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
