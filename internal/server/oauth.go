@@ -2,8 +2,6 @@ package server
 
 import (
 	"context"
-	"crypto/rand"
-	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -40,6 +38,9 @@ func newOAuthStore() *oauthStore {
 }
 
 func (s *oauthStore) put(sess *oauthSession) {
+	if sess == nil || sess.ID == "" {
+		return
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.gcLocked()
@@ -62,17 +63,13 @@ func (s *oauthStore) del(id string) {
 func (s *oauthStore) gcLocked() {
 	now := time.Now()
 	for id, sess := range s.byID {
-		if now.Sub(sess.CreatedAt) > oauthSessionTTL {
+		if sess == nil || now.Sub(sess.CreatedAt) > oauthSessionTTL {
 			delete(s.byID, id)
 		}
 	}
 }
 
-func newSessionID() string {
-	b := make([]byte, 16)
-	_, _ = rand.Read(b)
-	return hex.EncodeToString(b)
-}
+func newSessionID() string { return randHex(32) }
 
 // adminOAuthStart 发起 Passport 授权，返回浏览器登录 URL。
 func (h *Handler) adminOAuthStart(w http.ResponseWriter, r *http.Request) {
@@ -86,16 +83,16 @@ func (h *Handler) adminOAuthStart(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadGateway, map[string]any{"ok": false, "message": "login-config 失败: " + err.Error()})
 		return
 	}
-	state := randHex(16)
-	sid := randHex(16)
+	state := randHex(32)
+	sid := randHex(32)
 	u, err := url.Parse(loginEntry)
-	if err != nil {
+	if err != nil || u.Scheme == "" || u.Host == "" {
 		writeJSON(w, http.StatusBadGateway, map[string]any{"ok": false, "message": "解析 loginEntryUrl 失败"})
 		return
 	}
 	q := u.Query()
 	q.Set("state", state)
-	// 远端面板：回调到 127.0.0.1 打不开属正常，靠 poll-token 通道取 token
+	// 远端面板：回调到 127.0.0.1 打不开属正常，靠 poll-token 通道取 token。
 	q.Set("redirect", "http://127.0.0.1:37890/callback")
 	q.Set("sid", sid)
 	u.RawQuery = q.Encode()
@@ -122,10 +119,20 @@ func (h *Handler) adminOAuthPoll(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		SessionID string `json:"session_id"`
 	}
-	raw, _ := io.ReadAll(io.LimitReader(r.Body, 1<<20))
-	_ = r.Body.Close()
-	if len(raw) > 0 {
-		_ = json.Unmarshal(raw, &req)
+	body, err := io.ReadAll(io.LimitReader(r.Body, (1<<20)+1))
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"ok": false, "status": "error", "message": "读取请求失败"})
+		return
+	}
+	if len(body) > 1<<20 {
+		writeJSON(w, http.StatusRequestEntityTooLarge, map[string]any{"ok": false, "status": "error", "message": "请求体过大"})
+		return
+	}
+	if len(body) > 0 {
+		if err := json.Unmarshal(body, &req); err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]any{"ok": false, "status": "error", "message": "JSON 无效"})
+			return
+		}
 	}
 	if req.SessionID == "" {
 		req.SessionID = r.URL.Query().Get("session_id")
@@ -141,7 +148,7 @@ func (h *Handler) adminOAuthPoll(w http.ResponseWriter, r *http.Request) {
 	}
 
 	client := upstream.New(15 * time.Second)
-	tok, err := client.PollToken(context.Background(), sess.SID)
+	tok, err := client.PollToken(r.Context(), sess.SID)
 	if err != nil || tok == "" {
 		writeJSON(w, http.StatusOK, map[string]any{
 			"ok": true, "status": "pending", "message": "等待浏览器完成登录…",
@@ -149,15 +156,15 @@ func (h *Handler) adminOAuthPoll(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	user, err := client.CurrentUser(context.Background(), tok)
+	user, err := client.CurrentUser(r.Context(), tok)
 	if err != nil {
-		writeJSON(w, http.StatusOK, map[string]any{
+		writeJSON(w, http.StatusBadGateway, map[string]any{
 			"ok": false, "status": "error", "message": "current-user 失败: " + err.Error(),
 		})
 		return
 	}
 	if user == nil || user.UserID == "" {
-		writeJSON(w, http.StatusOK, map[string]any{
+		writeJSON(w, http.StatusBadGateway, map[string]any{
 			"ok": false, "status": "error", "message": "已拿到 token 但缺少 uid",
 		})
 		return
@@ -170,9 +177,13 @@ func (h *Handler) adminOAuthPoll(w http.ResponseWriter, r *http.Request) {
 		})
 		return
 	}
+	if h.cfg.Pool == nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]any{"ok": false, "status": "error", "message": "账号池未初始化"})
+		return
+	}
 	h.cfg.Pool.AddAccount(a)
 
-	// 非阻塞刷余额 + 尝试 register
+	// 非阻塞刷余额 + 尝试 register；请求已完成后使用独立的短超时 context。
 	go func(authCopy *auth.Auth) {
 		acct := h.cfg.Pool.Get(authCopy.UID)
 		if acct == nil {
