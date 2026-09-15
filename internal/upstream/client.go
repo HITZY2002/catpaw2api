@@ -527,7 +527,72 @@ type AssistantResult struct {
 	ErrCode   string
 }
 
-// PollAssistant 轮询 history 直到 assistant 消息出现且 finished=true，或超时/出错。
+type historyContent struct {
+	Type      string `json:"type"`
+	Text      string `json:"text"`
+	Reasoning string `json:"reasoning"`
+}
+
+type historyItem struct {
+	Type       string         `json:"type"`
+	Status     int            `json:"status"`
+	Finished   bool           `json:"finished"`
+	RoundID    any            `json:"roundId"`
+	CreateTime any            `json:"createTime"`
+	Content    []historyContent `json:"content"`
+	TotalUsage map[string]any `json:"totalUsage"`
+}
+
+func historyRound(v any) (float64, bool) {
+	switch n := v.(type) {
+	case float64:
+		return n, true
+	case int:
+		return float64(n), true
+	case int64:
+		return float64(n), true
+	case json.Number:
+		f, err := n.Float64()
+		return f, err == nil
+	case string:
+		f, err := strconv.ParseFloat(strings.TrimSpace(n), 64)
+		return f, err == nil
+	default:
+		return 0, false
+	}
+}
+
+func historyTime(v any) (time.Time, bool) {
+	s, ok := v.(string)
+	if !ok || strings.TrimSpace(s) == "" {
+		return time.Time{}, false
+	}
+	for _, layout := range []string{time.RFC3339Nano, time.RFC3339} {
+		if t, err := time.Parse(layout, s); err == nil {
+			return t, true
+		}
+	}
+	return time.Time{}, false
+}
+
+// historyNewer 尽量使用上游 roundId/createTime 判断新旧；元数据缺失时退回数组顺序。
+func historyNewer(candidate historyItem, candidateIndex int, current historyItem, currentIndex int) bool {
+	if cr, ok := historyRound(candidate.RoundID); ok {
+		if rr, rok := historyRound(current.RoundID); rok && cr != rr {
+			return cr > rr
+		}
+	}
+	if ct, ok := historyTime(candidate.CreateTime); ok {
+		if rt, rok := historyTime(current.CreateTime); rok && !ct.Equal(rt) {
+			return ct.After(rt)
+		}
+	}
+	return candidateIndex > currentIndex
+}
+
+// PollAssistant 轮询 history，始终选择最新一轮 assistant，并且只在 finished=true 时返回。
+// 旧实现命中第一个 assistant 就立即返回：多轮历史按时间正序时会重复返回上一轮回复，
+// 且 finished=false 时还会把半截内容错误标记为 length 后结束轮询。
 func (c *Client) PollAssistant(ctx context.Context, token, uid, conversationID string, opts PollOpts) (*AssistantResult, error) {
 	if opts.Interval <= 0 {
 		opts.Interval = 500 * time.Millisecond
@@ -548,61 +613,58 @@ func (c *Client) PollAssistant(ctx context.Context, token, uid, conversationID s
 	for {
 		attempt++
 		var data struct {
-			Items []struct {
-				Type     string `json:"type"`
-				Status   int    `json:"status"`
-				Finished bool   `json:"finished"`
-				Content  []struct {
-					Type      string `json:"type"`
-					Text      string `json:"text"`
-					Reasoning string `json:"reasoning"`
-				} `json:"content"`
-				TotalUsage map[string]any `json:"totalUsage"`
-			} `json:"items"`
+			Items []historyItem `json:"items"`
 		}
 		if err := c.doJSON(ctx, http.MethodGet, DirectHost, path, headers, nil, &data); err != nil {
 			return nil, err
 		}
-		var assistant = -1
-		var userUsage map[string]any
+
+		assistant := -1
+		latestUser := -1
 		for i, it := range data.Items {
-			if it.Type == "user" && it.TotalUsage != nil {
-				userUsage = it.TotalUsage
-			}
-			if it.Type == "assistant" {
-				assistant = i
-				break
+			switch it.Type {
+			case "assistant":
+				if assistant < 0 || historyNewer(it, i, data.Items[assistant], assistant) {
+					assistant = i
+				}
+			case "user":
+				if latestUser < 0 || historyNewer(it, i, data.Items[latestUser], latestUser) {
+					latestUser = i
+				}
 			}
 		}
+
 		if assistant >= 0 {
 			it := data.Items[assistant]
 			if it.Status != 0 && it.Status != 1 {
 				return nil, &UpstreamError{Code: fmt.Sprintf("status_%d", it.Status), Msg: "assistant generation failed"}
 			}
-			var sb strings.Builder
-			var rb strings.Builder
-			for _, c := range it.Content {
-				switch c.Type {
-				case "text":
-					sb.WriteString(c.Text)
-				case "reasoning":
-					if c.Reasoning != "" {
-						rb.WriteString(c.Reasoning)
-					} else {
-						rb.WriteString(c.Text)
+			if it.Finished {
+				var sb strings.Builder
+				var rb strings.Builder
+				for _, c := range it.Content {
+					switch c.Type {
+					case "text":
+						sb.WriteString(c.Text)
+					case "reasoning":
+						if c.Reasoning != "" {
+							rb.WriteString(c.Reasoning)
+						} else {
+							rb.WriteString(c.Text)
+						}
 					}
 				}
+				var userUsage map[string]any
+				if latestUser >= 0 {
+					userUsage = data.Items[latestUser].TotalUsage
+				}
+				return &AssistantResult{
+					Content:   sb.String(),
+					Reasoning: rb.String(),
+					Usage:     userUsage,
+					Finish:    "stop",
+				}, nil
 			}
-			finish := "stop"
-			if !it.Finished {
-				finish = "length"
-			}
-			return &AssistantResult{
-				Content:   sb.String(),
-				Reasoning: rb.String(),
-				Usage:     userUsage,
-				Finish:    finish,
-			}, nil
 		}
 		if time.Now().After(deadline) {
 			return nil, fmt.Errorf("poll assistant timeout after %s (%d attempts, conv=%s)", opts.Timeout, attempt, conversationID)
