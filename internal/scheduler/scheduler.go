@@ -19,6 +19,7 @@ import (
 	"fmt"
 	"log"
 	"net/url"
+	"sort"
 	"sync"
 	"time"
 
@@ -37,7 +38,7 @@ type Config struct {
 	ApplyCooldown   time.Duration // 两次申请最小间隔，默认 6h
 	RegisterOnStart bool          // 启动时领取注册奖励
 	// AutoRenew token 自动续期：剩余低于 RenewThreshold 时发起 OAuth。
-	AutoRenew       bool          // 是否启用自动续期
+	AutoRenew       bool          // 是否启用自动续期（与额度 watchdog 独立）
 	RenewThreshold  time.Duration // 触发续期的剩余时间阈值，默认 6h
 	RenewWaitMax    time.Duration // 单次续期轮询最长等待，默认 15m
 	AuthDir         string        // auths 目录（续期成功后落盘）
@@ -51,8 +52,8 @@ type Scheduler struct {
 
 	// renewMu 保护 renewing 映射
 	renewMu     sync.Mutex
-	renewing    map[string]bool          // account → 是否正在续期
-	renewStatus map[string]*RenewStatus  // account → 续期状态
+	renewing    map[string]bool         // account → 是否正在续期
+	renewStatus map[string]*RenewStatus // account → 续期状态
 }
 
 // RenewStatus 单个账号的续期状态（供 WebUI 展示）。
@@ -93,20 +94,25 @@ func New(cfg Config) *Scheduler {
 	}
 }
 
-// Run 启动定时循环。
+// Run 启动定时循环。额度 watchdog 与 AutoRenew 独立：关闭额度轮询不应顺带关闭 token 续期。
 func (s *Scheduler) Run(ctx context.Context) {
-	if s.cfg.RegisterOnStart {
-		s.RegisterAll(ctx)
-	}
-	if !s.cfg.Enabled {
-		log.Printf("quota watchdog disabled")
+	if s.cfg.Pool == nil {
+		log.Printf("scheduler disabled: nil pool")
 		return
 	}
-	log.Printf("quota watchdog enabled: poll=%s threshold=%d method=%s cooldown=%s auto_renew=%v renew_threshold=%s",
-		s.cfg.PollInterval, s.cfg.ApplyThreshold, s.cfg.ApplyMethod, s.cfg.ApplyCooldown,
+	if s.cfg.Enabled && s.cfg.RegisterOnStart {
+		s.RegisterAll(ctx)
+	}
+	if !s.cfg.Enabled && !s.cfg.AutoRenew {
+		log.Printf("quota watchdog and auto-renew disabled")
+		return
+	}
+	log.Printf("scheduler started: quota_enabled=%v poll=%s threshold=%d method=%s auto_renew=%v renew_threshold=%s",
+		s.cfg.Enabled, s.cfg.PollInterval, s.cfg.ApplyThreshold, s.cfg.ApplyMethod,
 		s.cfg.AutoRenew, s.cfg.RenewThreshold)
-	// 启动时立即跑一次续期巡检（不等第一个 ticker），让快过期的 token 尽早发起续期。
+	// 启动时立即巡检续期/过期状态，不等第一个 ticker。
 	s.renewSweep(ctx)
+	s.expirySweep()
 	ticker := time.NewTicker(s.cfg.PollInterval)
 	defer ticker.Stop()
 	for {
@@ -119,11 +125,13 @@ func (s *Scheduler) Run(ctx context.Context) {
 	}
 }
 
-// Tick 遍历全部账号：token 续期巡检 → 到期巡检 → 查余额 → 低于阈值自动申请 →
-// 余额归零的账号进 CoolPlan 冷却（下一个轮询周期重查），余额恢复的账号自动解冻。
+// Tick 遍历全部账号：先做 token 续期/到期巡检；额度 watchdog 开启时再查余额与申请。
 func (s *Scheduler) Tick(ctx context.Context) {
 	s.renewSweep(ctx)
 	s.expirySweep()
+	if !s.cfg.Enabled {
+		return
+	}
 	for _, acct := range s.cfg.Pool.Accounts() {
 		n, err := s.refreshBalance(ctx, acct)
 		if err != nil {
@@ -168,6 +176,9 @@ func (s *Scheduler) refreshBalance(ctx context.Context, acct *pool.Account) (int
 // 24h 内将过期打告警日志提醒重登。
 func (s *Scheduler) expirySweep() {
 	for _, acct := range s.cfg.Pool.Accounts() {
+		if acct == nil || acct.Auth == nil {
+			continue
+		}
 		switch {
 		case acct.Auth.Expired():
 			if !s.cfg.Pool.IsDisabled(acct.Name) {
@@ -181,29 +192,19 @@ func (s *Scheduler) expirySweep() {
 }
 
 // renewSweep 检测 token 即将过期（< RenewThreshold）的账号，自动发起 OAuth 续期。
-//
-// CatPaw 无 refresh_token，续期 = 重新走 OAuth login：
-//  1. GET login-config → loginEntryUrl
-//  2. 生成 sid/state，拼 auth_url（带 sid）
-//  3. 轮询 poll-token?sid= 等待新 token（需浏览器打开 auth_url 完成登录）
-//
-// 服务器无浏览器，因此：
-// - auth_url 记录到 RenewStatus 供 WebUI 展示（用户可点链接完成）
-// - 若用户的浏览器保持美团登录态，打开 auth_url 会静默拿到 token
-// - 轮询在后台进行，成功后自动更新 pool + 落盘
 func (s *Scheduler) renewSweep(ctx context.Context) {
-	if !s.cfg.AutoRenew {
+	if !s.cfg.AutoRenew || s.cfg.Pool == nil {
 		return
 	}
 	for _, acct := range s.cfg.Pool.Accounts() {
-		if acct.Auth == nil {
+		if acct == nil || acct.Auth == nil {
 			continue
 		}
 		remaining := acct.Auth.Remaining()
 		if remaining <= 0 || remaining > s.cfg.RenewThreshold {
 			continue
 		}
-		// 已在续期中则跳过
+		// 已在续期中则跳过。
 		s.renewMu.Lock()
 		if s.renewing[acct.Name] {
 			s.renewMu.Unlock()
@@ -252,7 +253,8 @@ func (s *Scheduler) renewAccount(ctx context.Context, acct *pool.Account) {
 	authURL := u.String()
 
 	s.setRenewStatus(acct, authURL, false, "")
-	log.Printf("renew account=%s auth_url=%s", acct.Name, authURL)
+	// authURL 含一次性 sid/state，不写入普通日志；WebUI 通过 RenewStatus 获取即可。
+	log.Printf("renew account=%s waiting for browser authorization", acct.Name)
 
 	// 3. 轮询 poll-token（最长等待 RenewWaitMax）
 	renewCtx, cancel := context.WithTimeout(ctx, s.cfg.RenewWaitMax)
@@ -271,8 +273,26 @@ func (s *Scheduler) renewAccount(ctx context.Context, acct *pool.Account) {
 			if err != nil || tok == "" {
 				continue
 			}
-			// 4. 拿到新 token：更新 pool + 落盘
-			newAuth := auth.New(acct.UID, acct.UserName, tok)
+
+			// 必须确认浏览器完成授权的账号就是正在续期的账号。
+			user, err := client.CurrentUser(renewCtx, tok)
+			if err != nil {
+				s.setRenewStatus(acct, authURL, false, "续期 token 身份校验失败: "+err.Error())
+				log.Printf("renew account=%s identity check error: %v", acct.Name, err)
+				return
+			}
+			if err := validateRenewedIdentity(acct, user); err != nil {
+				s.setRenewStatus(acct, authURL, false, err.Error())
+				log.Printf("renew account=%s identity mismatch", acct.Name)
+				return
+			}
+
+			// 4. 拿到匹配账号的新 token：更新 pool + 落盘。
+			userName := acct.UserName
+			if user != nil && user.UserName != "" {
+				userName = user.UserName
+			}
+			newAuth := auth.New(acct.UID, userName, tok)
 			if s.cfg.AuthDir != "" {
 				if err := auth.SaveNew(s.cfg.AuthDir, newAuth); err != nil {
 					s.setRenewStatus(acct, authURL, false, "落盘失败: "+err.Error())
@@ -280,10 +300,7 @@ func (s *Scheduler) renewAccount(ctx context.Context, acct *pool.Account) {
 					return
 				}
 			}
-			// 更新 pool 里的 token（AddAccount 同 UID 会覆盖 token）
-			s.cfg.Pool.AddAccount(newAuth)
-			// 解除禁用状态
-			s.cfg.Pool.Enable(acct.Name, acct.Auth.Remaining().Round(time.Minute).Milliseconds()/int64(time.Minute))
+			s.installRenewedAuth(newAuth)
 			s.setRenewStatus(acct, authURL, true, "")
 			log.Printf("renew account=%s SUCCESS new token remaining=72h", acct.Name)
 			return
@@ -291,21 +308,51 @@ func (s *Scheduler) renewAccount(ctx context.Context, acct *pool.Account) {
 	}
 }
 
+func validateRenewedIdentity(acct *pool.Account, user *upstream.UserInfo) error {
+	if acct == nil || user == nil || user.UserID == "" {
+		return fmt.Errorf("续期身份校验失败：缺少账号身份")
+	}
+	if user.UserID != acct.UID {
+		return fmt.Errorf("续期账号不匹配：浏览器登录的账号不是目标账号，请切换到正确账号后重新授权")
+	}
+	return nil
+}
+
+// installRenewedAuth 替换 token 并清理冷却/错误状态，但保留真实余额缓存。
+// 旧实现误把 token 剩余分钟数写入 balance，导致余额与账号排序被污染。
+func (s *Scheduler) installRenewedAuth(newAuth *auth.Auth) *pool.Account {
+	if s.cfg.Pool == nil || newAuth == nil {
+		return nil
+	}
+	updated := s.cfg.Pool.AddAccount(newAuth)
+	if updated != nil {
+		s.cfg.Pool.Unfreeze(updated.Name)
+	}
+	return updated
+}
+
 // setRenewStatus 更新续期状态（供 WebUI 查询）。
 func (s *Scheduler) setRenewStatus(acct *pool.Account, authURL string, done bool, errMsg string) {
+	if acct == nil {
+		return
+	}
 	s.renewMu.Lock()
 	defer s.renewMu.Unlock()
+	startedAt := time.Now()
+	if old := s.renewStatus[acct.Name]; old != nil && !old.StartedAt.IsZero() {
+		startedAt = old.StartedAt
+	}
 	s.renewStatus[acct.Name] = &RenewStatus{
 		Account:   acct.Name,
 		UID:       acct.UID,
 		AuthURL:   authURL,
-		StartedAt: time.Now(),
+		StartedAt: startedAt,
 		Done:      done,
 		Error:     errMsg,
 	}
 }
 
-// RenewStatuses 返回所有账号的续期状态快照（供 WebUI 展示）。
+// RenewStatuses 返回所有账号的续期状态快照（供 WebUI 展示），按账号稳定排序。
 func (s *Scheduler) RenewStatuses() []RenewStatus {
 	s.renewMu.Lock()
 	defer s.renewMu.Unlock()
@@ -313,19 +360,30 @@ func (s *Scheduler) RenewStatuses() []RenewStatus {
 	for _, st := range s.renewStatus {
 		out = append(out, *st)
 	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Account < out[j].Account })
 	return out
 }
 
 func randHex(n int) string {
+	if n <= 0 {
+		return ""
+	}
 	b := make([]byte, (n+1)/2)
 	if _, err := rand.Read(b); err != nil {
-		return fmt.Sprintf("%x", time.Now().UnixNano())[:n]
+		seed := fmt.Sprintf("%x", time.Now().UnixNano())
+		for len(seed) < n {
+			seed += seed
+		}
+		return seed[:n]
 	}
 	return hex.EncodeToString(b)[:n]
 }
 
 // RegisterAll 启动时为每个账号领取注册奖励（幂等）。
 func (s *Scheduler) RegisterAll(ctx context.Context) {
+	if s.cfg.Pool == nil {
+		return
+	}
 	for _, acct := range s.cfg.Pool.Accounts() {
 		res, err := acct.Client.Register(ctx, acct.Auth.Token())
 		if err != nil {
