@@ -162,7 +162,7 @@ func (s *Scheduler) Tick(ctx context.Context) {
 
 // refreshBalance 拉一次余额并写回池缓存。
 func (s *Scheduler) refreshBalance(ctx context.Context, acct *pool.Account) (int64, error) {
-	balance, err := acct.Client.CreditBalance(ctx, acct.Auth.Token())
+	balance, err := acct.Client.CreditBalance(ctx, acct.Token())
 	if err != nil {
 		return 0, err
 	}
@@ -176,17 +176,17 @@ func (s *Scheduler) refreshBalance(ctx context.Context, acct *pool.Account) (int
 // 24h 内将过期打告警日志提醒重登。
 func (s *Scheduler) expirySweep() {
 	for _, acct := range s.cfg.Pool.Accounts() {
-		if acct == nil || acct.Auth == nil {
+		if acct == nil || acct.Token() == "" {
 			continue
 		}
 		switch {
-		case acct.Auth.Expired():
+		case acct.TokenExpired():
 			if !s.cfg.Pool.IsDisabled(acct.Name) {
 				s.cfg.Pool.Disable(acct.Name, "token expired (72h), re-login via catpaw2api-login")
 			}
-		case acct.Auth.ExpiringSoon(24 * time.Hour):
+		case acct.TokenExpiringSoon(24 * time.Hour):
 			log.Printf("quota token account=%s expiring soon (remaining=%s), run catpaw2api-login to refresh",
-				acct.Name, acct.Auth.Remaining().Round(time.Minute))
+				acct.Name, acct.TokenRemaining().Round(time.Minute))
 		}
 	}
 }
@@ -197,10 +197,10 @@ func (s *Scheduler) renewSweep(ctx context.Context) {
 		return
 	}
 	for _, acct := range s.cfg.Pool.Accounts() {
-		if acct == nil || acct.Auth == nil {
+		if acct == nil || acct.Token() == "" {
 			continue
 		}
-		remaining := acct.Auth.Remaining()
+		remaining := acct.TokenRemaining()
 		if remaining <= 0 || remaining > s.cfg.RenewThreshold {
 			continue
 		}
@@ -237,12 +237,22 @@ func (s *Scheduler) renewAccount(ctx context.Context, acct *pool.Account) {
 		return
 	}
 
-	// 2. 拼 auth_url
-	sid := randHex(16)
-	state := randHex(16)
-	u, err := url.Parse(loginEntry)
+	// 2. 拼 auth_url。OAuth state/sid 必须来自 crypto/rand；熵源失败时拒绝续期，绝不降级为时间戳。
+	sid, err := secureRandHex(32)
 	if err != nil {
-		s.setRenewStatus(acct, "", false, "解析 loginEntryUrl 失败: "+err.Error())
+		s.setRenewStatus(acct, "", false, "生成安全 sid 失败: "+err.Error())
+		log.Printf("renew account=%s secure sid error: %v", acct.Name, err)
+		return
+	}
+	state, err := secureRandHex(32)
+	if err != nil {
+		s.setRenewStatus(acct, "", false, "生成安全 state 失败: "+err.Error())
+		log.Printf("renew account=%s secure state error: %v", acct.Name, err)
+		return
+	}
+	u, err := url.Parse(loginEntry)
+	if err != nil || u.Scheme == "" || u.Host == "" {
+		s.setRenewStatus(acct, "", false, "解析 loginEntryUrl 失败")
 		return
 	}
 	q := u.Query()
@@ -288,7 +298,7 @@ func (s *Scheduler) renewAccount(ctx context.Context, acct *pool.Account) {
 			}
 
 			// 4. 拿到匹配账号的新 token：更新 pool + 落盘。
-			userName := acct.UserName
+			userName := acct.UserNameSnapshot()
 			if user != nil && user.UserName != "" {
 				userName = user.UserName
 			}
@@ -364,19 +374,15 @@ func (s *Scheduler) RenewStatuses() []RenewStatus {
 	return out
 }
 
-func randHex(n int) string {
+func secureRandHex(n int) (string, error) {
 	if n <= 0 {
-		return ""
+		return "", fmt.Errorf("random hex length must be positive")
 	}
 	b := make([]byte, (n+1)/2)
 	if _, err := rand.Read(b); err != nil {
-		seed := fmt.Sprintf("%x", time.Now().UnixNano())
-		for len(seed) < n {
-			seed += seed
-		}
-		return seed[:n]
+		return "", fmt.Errorf("crypto/rand: %w", err)
 	}
-	return hex.EncodeToString(b)[:n]
+	return hex.EncodeToString(b)[:n], nil
 }
 
 // RegisterAll 启动时为每个账号领取注册奖励（幂等）。
@@ -385,7 +391,7 @@ func (s *Scheduler) RegisterAll(ctx context.Context) {
 		return
 	}
 	for _, acct := range s.cfg.Pool.Accounts() {
-		res, err := acct.Client.Register(ctx, acct.Auth.Token())
+		res, err := acct.Client.Register(ctx, acct.Token())
 		if err != nil {
 			log.Printf("quota register account=%s error: %v", acct.Name, err)
 			continue
@@ -413,14 +419,14 @@ func (s *Scheduler) maybeApply(ctx context.Context, acct *pool.Account) {
 
 	switch s.cfg.ApplyMethod {
 	case "register":
-		res, err := acct.Client.Register(ctx, acct.Auth.Token())
+		res, err := acct.Client.Register(ctx, acct.Token())
 		if err != nil {
 			log.Printf("quota apply account=%s register failed: %v", acct.Name, err)
 			return
 		}
 		log.Printf("quota apply account=%s register done newUser=%v bonus=%d", acct.Name, res.NewUser, res.RegistrationBonus)
 	case "campaign":
-		out, err := acct.Client.CampaignInit(ctx, acct.Auth.Token())
+		out, err := acct.Client.CampaignInit(ctx, acct.Token())
 		if err != nil {
 			log.Printf("quota apply account=%s campaign failed: %v", acct.Name, err)
 			return
