@@ -27,9 +27,9 @@ const (
 
 // Account 一个上游账号。
 //
-// Name/UID/UserName/Auth/Client 在账号发布到 Pool 后视为稳定引用：热续期或 reload
-// 不替换 Auth 指针，而是通过 auth.Auth.ReplaceFrom 原子更新其内部凭证。这样运行中的
-// 请求即使持有 *Account，也不会与 credential pointer replacement 形成数据竞争。
+// Name/UID/Auth/Client 在账号发布到 Pool 后视为稳定引用：热续期或 reload
+// 不替换 Auth 指针，而是通过 auth.Auth.ReplaceFrom 原子更新其内部凭证。
+// UserName 允许刷新，但所有读写都必须经 Account.mu 或 snapshot accessor。
 type Account struct {
 	Name         string `json:"name"` // 默认 = UID
 	UID          string `json:"uid"`
@@ -200,6 +200,7 @@ func (p *Pool) AddAccount(a *auth.Auth) *Account {
 			return nil
 		}
 		existing.mu.Lock()
+		existing.UserName = a.UserName
 		existing.disabled = false
 		existing.disabledReason = ""
 		existing.lastErr = ""
@@ -247,6 +248,7 @@ func (p *Pool) SyncToDir(auths []*auth.Auth) {
 				continue
 			}
 			existing.mu.Lock()
+			existing.UserName = a.UserName
 			existing.lastValidated = time.Time{}
 			existing.mu.Unlock()
 			next = append(next, existing)
