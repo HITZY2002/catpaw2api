@@ -4,8 +4,10 @@ package pool
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"log"
 	"os"
+	"path/filepath"
 	"sort"
 	"sync"
 	"time"
@@ -78,24 +80,32 @@ func New(auths []*auth.Auth, cfg Config, stateFile string) (*Pool, error) {
 	}
 	p := &Pool{cfg: cfg, state: stateFile}
 	for _, a := range auths {
-		acct := &Account{
-			Name:     a.UID,
-			UID:      a.UID,
-			UserName: a.UserName,
-			Auth:     a,
-			Client:   upstream.New(cfg.UpstreamTimeout),
+		if a == nil || a.UID == "" || a.Token() == "" {
+			continue
 		}
-		p.accounts = append(p.accounts, acct)
+		p.accounts = append(p.accounts, newAccount(a, cfg.UpstreamTimeout))
 	}
 	p.loadState()
 	return p, nil
 }
 
-// Accounts 返回全部账号（含状态）。
+func newAccount(a *auth.Auth, timeout time.Duration) *Account {
+	return &Account{
+		Name:     a.UID,
+		UID:      a.UID,
+		UserName: a.UserName,
+		Auth:     a,
+		Client:   upstream.New(timeout),
+	}
+}
+
+// Accounts 返回账号指针的切片快照；调用方不能通过修改 slice 本身破坏 pool 内部结构。
 func (p *Pool) Accounts() []*Account {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	return p.accounts
+	out := make([]*Account, len(p.accounts))
+	copy(out, p.accounts)
+	return out
 }
 
 // Get 按名字取账号（显式 conversation 路由用），找不到返回 nil。
@@ -112,18 +122,22 @@ func (p *Pool) Get(name string) *Account {
 
 // List 状态快照（脱敏；字段对齐 WorkBuddy 面板：nickname/credits/disabled/cooling）。
 func (p *Pool) List() []map[string]any {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	out := make([]map[string]any, 0, len(p.accounts))
+	accounts := p.Accounts()
+	out := make([]map[string]any, 0, len(accounts))
 	now := time.Now()
-	for _, a := range p.accounts {
+	for _, a := range accounts {
 		a.mu.Lock()
 		cooling := !a.disabled && now.Before(a.coolUntil)
 		until := ""
 		if cooling {
 			until = a.coolUntil.Format(time.RFC3339)
 		}
-		remaining := a.Auth.Remaining()
+		remaining := time.Duration(0)
+		tokenAge := time.Duration(0)
+		if a.Auth != nil {
+			remaining = a.Auth.Remaining()
+			tokenAge = a.Auth.Age()
+		}
 		reason := a.disabledReason
 		if reason == "" {
 			reason = a.lastErr
@@ -149,7 +163,7 @@ func (p *Pool) List() []map[string]any {
 			"err_count":       a.errCount,
 			"reason":          reason,
 			"last_error":      a.lastErr,
-			"token_age":       a.Auth.Age().Round(time.Minute).String(),
+			"token_age":       tokenAge.Round(time.Minute).String(),
 			"token_remaining": remaining.Round(time.Minute).String(),
 			"token_expiring":  remaining > 0 && remaining <= 24*time.Hour,
 		})
@@ -159,17 +173,10 @@ func (p *Pool) List() []map[string]any {
 	return out
 }
 
-// AddAccount 动态加入账号（OAuth 登录成功后热加载）；同 UID 则覆盖 token。
+// AddAccount 动态加入账号；同 UID 替换 token，同时清掉旧 token 遗留的禁用/冷却/错误状态，保留真实余额。
 func (p *Pool) AddAccount(a *auth.Auth) *Account {
-	if a == nil || a.UID == "" {
+	if a == nil || a.UID == "" || a.Token() == "" {
 		return nil
-	}
-	acct := &Account{
-		Name:     a.UID,
-		UID:      a.UID,
-		UserName: a.UserName,
-		Auth:     a,
-		Client:   upstream.New(p.cfg.UpstreamTimeout),
 	}
 	p.mu.Lock()
 	for _, existing := range p.accounts {
@@ -180,12 +187,17 @@ func (p *Pool) AddAccount(a *auth.Auth) *Account {
 			existing.disabled = false
 			existing.disabledReason = ""
 			existing.lastErr = ""
+			existing.errCount = 0
+			existing.coolUntil = time.Time{}
+			existing.coolKind = CoolSoft
+			existing.lastValidated = time.Time{}
 			existing.mu.Unlock()
 			p.mu.Unlock()
 			p.saveState()
 			return existing
 		}
 	}
+	acct := newAccount(a, p.cfg.UpstreamTimeout)
 	p.accounts = append(p.accounts, acct)
 	p.mu.Unlock()
 	p.saveState()
@@ -196,45 +208,42 @@ func (p *Pool) AddAccount(a *auth.Auth) *Account {
 // SyncToDir 用磁盘 auths 全量对齐内存池（重载）。
 func (p *Pool) SyncToDir(auths []*auth.Auth) {
 	p.mu.Lock()
-	defer p.mu.Unlock()
 	byUID := map[string]*Account{}
 	for _, a := range p.accounts {
 		byUID[a.UID] = a
 	}
 	next := make([]*Account, 0, len(auths))
 	for _, a := range auths {
+		if a == nil || a.UID == "" || a.Token() == "" {
+			continue
+		}
 		if existing, ok := byUID[a.UID]; ok {
 			existing.mu.Lock()
 			existing.Auth = a
 			existing.UserName = a.UserName
+			existing.lastValidated = time.Time{}
 			existing.mu.Unlock()
 			next = append(next, existing)
 			delete(byUID, a.UID)
 		} else {
-			next = append(next, &Account{
-				Name:     a.UID,
-				UID:      a.UID,
-				UserName: a.UserName,
-				Auth:     a,
-				Client:   upstream.New(p.cfg.UpstreamTimeout),
-			})
+			next = append(next, newAccount(a, p.cfg.UpstreamTimeout))
 		}
 	}
 	p.accounts = next
+	p.mu.Unlock()
+	p.saveState()
 }
 
-// PickExcluding 挑一个健康账号：余额降序（与 traework2api/workbuddy2api 一致），
-// 余额相同按 UID 字典序保证稳定。
+// PickExcluding 挑一个健康账号：余额降序，余额相同按 UID 字典序保证稳定。
 func (p *Pool) PickExcluding(tried map[string]bool) *Account {
-	p.mu.Lock()
-	defer p.mu.Unlock()
+	accounts := p.Accounts()
 	now := time.Now()
 	type cand struct {
 		a       *Account
 		balance int64
 	}
 	var cands []cand
-	for _, a := range p.accounts {
+	for _, a := range accounts {
 		if tried != nil && tried[a.Name] {
 			continue
 		}
@@ -258,24 +267,22 @@ func (p *Pool) PickExcluding(tried map[string]bool) *Account {
 	return cands[0].a
 }
 
-// Validate 校验 token（带 5 分钟缓存）；401/403 禁用账号。
+// Validate 校验 token（带 5 分钟缓存）。只有明确 401/403 才禁用；网络错误/5xx 不得永久打死账号。
 func (p *Pool) Validate(a *Account) (bool, error) {
+	if a == nil || a.Auth == nil || a.Client == nil {
+		return false, fmt.Errorf("invalid account")
+	}
 	a.mu.Lock()
-	if time.Since(a.lastValidated) < 5*time.Minute {
+	if !a.lastValidated.IsZero() && time.Since(a.lastValidated) < 5*time.Minute {
 		ok := !a.disabled
 		a.mu.Unlock()
 		return ok, nil
 	}
 	a.mu.Unlock()
-	
-	// Ping to validate token
+
 	ok, err := a.Client.Ping(context.Background(), a.Auth.Token())
 	if err != nil {
-		a.mu.Lock()
-		a.disabled = true
-		a.disabledReason = "token invalid (network error)"
-		a.lastErr = err.Error()
-		a.mu.Unlock()
+		// Validation endpoint 暂时不可达时采用 best-effort：不改变持久状态，由真实请求继续判定。
 		return false, err
 	}
 	if !ok {
@@ -283,21 +290,25 @@ func (p *Pool) Validate(a *Account) (bool, error) {
 		a.disabled = true
 		a.disabledReason = "token invalid (401/403)"
 		a.lastErr = "token invalid"
+		a.lastValidated = time.Now()
 		a.mu.Unlock()
+		p.saveState()
 		return false, nil
 	}
-	
+
 	a.mu.Lock()
 	a.lastValidated = time.Now()
+	if a.lastErr == "token invalid" {
+		a.lastErr = ""
+	}
 	a.mu.Unlock()
 	return true, nil
 }
 
 // Cooldown 冷却账号。
 func (p *Pool) Cooldown(name string, kind CoolKind, dur time.Duration, reason string) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	for _, a := range p.accounts {
+	changed := false
+	for _, a := range p.Accounts() {
 		if a.Name != name {
 			continue
 		}
@@ -306,16 +317,24 @@ func (p *Pool) Cooldown(name string, kind CoolKind, dur time.Duration, reason st
 		a.coolKind = kind
 		a.lastErr = reason
 		a.mu.Unlock()
+		changed = true
 		log.Printf("pool cooldown account=%s kind=%d dur=%s reason=%s", name, kind, dur, reason)
 	}
-	p.saveState()
+	if changed {
+		p.saveState()
+	}
 }
 
-// NoteError 累计错误。
+// NoteError 累计错误，达到阈值后进入临时冷却而不是永久禁用。
 func (p *Pool) NoteError(name string, threshold int, cooldown time.Duration) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	for _, a := range p.accounts {
+	if threshold <= 0 {
+		threshold = p.cfg.ErrThreshold
+	}
+	if cooldown <= 0 {
+		cooldown = p.cfg.ErrCooldown
+	}
+	changed := false
+	for _, a := range p.Accounts() {
 		if a.Name != name {
 			continue
 		}
@@ -323,37 +342,44 @@ func (p *Pool) NoteError(name string, threshold int, cooldown time.Duration) {
 		a.errCount++
 		if a.errCount >= threshold {
 			a.coolUntil = time.Now().Add(cooldown)
+			a.coolKind = CoolErr
 			a.lastErr = "consecutive errors"
 		}
 		a.mu.Unlock()
+		changed = true
 	}
-	p.saveState()
+	if changed {
+		p.saveState()
+	}
 }
 
-// NoteSuccess 清零错误计数。
+// NoteSuccess 清零错误计数，并持久化恢复状态；不主动清仍有效的 cooldown。
 func (p *Pool) NoteSuccess(name string) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	for _, a := range p.accounts {
+	changed := false
+	for _, a := range p.Accounts() {
 		if a.Name == name {
 			a.mu.Lock()
-			a.errCount = 0
+			if a.errCount != 0 {
+				a.errCount = 0
+				changed = true
+			}
 			a.mu.Unlock()
 		}
+	}
+	if changed {
+		p.saveState()
 	}
 }
 
 // Unfreeze 解冻账号：清除冷却与错误计数（不动 disabled 状态）。
-// 用于额度恢复后自动解冻（对齐 traework2api 签到解冻语义）。
 func (p *Pool) Unfreeze(name string) {
-	p.mu.Lock()
 	changed := false
-	for _, a := range p.accounts {
+	for _, a := range p.Accounts() {
 		if a.Name != name {
 			continue
 		}
 		a.mu.Lock()
-		if time.Now().Before(a.coolUntil) || a.errCount > 0 {
+		if !a.coolUntil.IsZero() || a.errCount > 0 || (a.lastErr != "" && !a.disabled) {
 			a.coolUntil = time.Time{}
 			a.errCount = 0
 			a.lastErr = ""
@@ -362,7 +388,6 @@ func (p *Pool) Unfreeze(name string) {
 		}
 		a.mu.Unlock()
 	}
-	p.mu.Unlock()
 	if changed {
 		p.saveState()
 	}
@@ -370,12 +395,10 @@ func (p *Pool) Unfreeze(name string) {
 
 // Healthy 查询账号当前可用（未禁用且不在冷却中）。
 func (p *Pool) Healthy(name string) bool {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	for _, a := range p.accounts {
+	for _, a := range p.Accounts() {
 		if a.Name == name {
 			a.mu.Lock()
-			healthy := !a.disabled && time.Now().After(a.coolUntil)
+			healthy := !a.disabled && !time.Now().Before(a.coolUntil)
 			a.mu.Unlock()
 			return healthy
 		}
@@ -383,11 +406,9 @@ func (p *Pool) Healthy(name string) bool {
 	return false
 }
 
-// IsDisabled 查询账号是否已禁用（幂等巡检用，避免重复禁用刷日志）。
+// IsDisabled 查询账号是否已禁用。
 func (p *Pool) IsDisabled(name string) bool {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	for _, a := range p.accounts {
+	for _, a := range p.Accounts() {
 		if a.Name == name {
 			a.mu.Lock()
 			d := a.disabled
@@ -400,87 +421,110 @@ func (p *Pool) IsDisabled(name string) bool {
 
 // Disable 禁用账号。
 func (p *Pool) Disable(name, reason string) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	for _, a := range p.accounts {
+	changed := false
+	for _, a := range p.Accounts() {
 		if a.Name == name {
 			a.mu.Lock()
 			a.disabled = true
 			a.disabledReason = reason
 			a.lastErr = reason
 			a.mu.Unlock()
+			changed = true
 			log.Printf("pool disable account=%s reason=%s", name, reason)
 		}
 	}
-	p.saveState()
+	if changed {
+		p.saveState()
+	}
 }
 
-// Enable 解冻账号（可选设置余额）。
+// Enable 显式启用账号并可设置余额（admin 操作用；token 续期不应借此写入伪余额）。
 func (p *Pool) Enable(name string, balance int64) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	for _, a := range p.accounts {
+	changed := false
+	for _, a := range p.Accounts() {
 		if a.Name == name {
 			a.mu.Lock()
 			a.disabled = false
 			a.disabledReason = ""
 			a.lastErr = ""
+			a.errCount = 0
+			a.coolUntil = time.Time{}
 			a.balance = balance
+			a.lastBalanceAt = time.Now()
 			a.mu.Unlock()
+			changed = true
 			log.Printf("pool enable account=%s", name)
 		}
 	}
-	p.saveState()
+	if changed {
+		p.saveState()
+	}
 }
 
 // ClearCooldown 清冷却。
 func (p *Pool) ClearCooldown(name string) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	for _, a := range p.accounts {
+	changed := false
+	for _, a := range p.Accounts() {
 		if a.Name == name {
 			a.mu.Lock()
 			a.coolUntil = time.Time{}
 			a.coolKind = CoolSoft
 			a.mu.Unlock()
+			changed = true
 			log.Printf("pool clear cooldown account=%s", name)
 		}
 	}
-	p.saveState()
+	if changed {
+		p.saveState()
+	}
 }
 
 // Stats 汇总账号状态。
 func (p *Pool) Stats() (total, healthy, disabled, cooling int, credits int64) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	for _, a := range p.accounts {
+	now := time.Now()
+	for _, a := range p.Accounts() {
+		a.mu.Lock()
 		total++
 		credits += a.balance
-		if a.disabled {
+		switch {
+		case a.disabled:
 			disabled++
-			continue
-		}
-		if a.coolUntil.After(time.Now()) {
+		case a.coolUntil.After(now):
 			cooling++
-			continue
+		default:
+			healthy++
 		}
-		healthy++
+		a.mu.Unlock()
 	}
 	return
 }
 
-// SetBalance 更新余额缓存。
+// SetBalance 更新余额缓存并立即持久化。
 func (p *Pool) SetBalance(name string, balance int64) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	for _, a := range p.accounts {
+	changed := false
+	for _, a := range p.Accounts() {
 		if a.Name == name {
 			a.mu.Lock()
 			a.balance = balance
 			a.lastBalanceAt = time.Now()
 			a.mu.Unlock()
+			changed = true
 		}
 	}
+	if changed {
+		p.saveState()
+	}
+}
+
+type stateEntry struct {
+	Name      string    `json:"name"`
+	ErrCount  int       `json:"err_count"`
+	CoolUntil time.Time `json:"cool_until"`
+	Disabled  bool      `json:"disabled"`
+	Reason    string    `json:"reason"`
+	LastErr   string    `json:"last_error"`
+	Balance   int64     `json:"balance"`
+	BalanceAt time.Time `json:"balance_at"`
 }
 
 // loadState / saveState 持久化冷却与余额。
@@ -492,33 +536,29 @@ func (p *Pool) loadState() {
 	if err != nil {
 		return
 	}
-	var data []struct {
-		Name      string    `json:"name"`
-		ErrCount  int       `json:"err_count"`
-		CoolUntil time.Time `json:"cool_until"`
-		Disabled  bool      `json:"disabled"`
-		Reason    string    `json:"reason"`
-		LastErr   string    `json:"last_error"`
-		Balance   int64     `json:"balance"`
-		BalanceAt time.Time `json:"balance_at"`
-	}
-	if json.Unmarshal(raw, &data) != nil {
+	var data []stateEntry
+	if err := json.Unmarshal(raw, &data); err != nil {
+		log.Printf("pool load state: %v", err)
 		return
 	}
-	for _, a := range p.accounts {
-		for _, s := range data {
-			if s.Name == a.Name {
-				a.mu.Lock()
-				a.errCount = s.ErrCount
-				a.coolUntil = s.CoolUntil
-				a.disabled = s.Disabled
-				a.disabledReason = s.Reason
-				a.lastErr = s.LastErr
-				a.balance = s.Balance
-				a.lastBalanceAt = s.BalanceAt
-				a.mu.Unlock()
-			}
+	byName := make(map[string]stateEntry, len(data))
+	for _, s := range data {
+		byName[s.Name] = s
+	}
+	for _, a := range p.Accounts() {
+		s, ok := byName[a.Name]
+		if !ok {
+			continue
 		}
+		a.mu.Lock()
+		a.errCount = s.ErrCount
+		a.coolUntil = s.CoolUntil
+		a.disabled = s.Disabled
+		a.disabledReason = s.Reason
+		a.lastErr = s.LastErr
+		a.balance = s.Balance
+		a.lastBalanceAt = s.BalanceAt
+		a.mu.Unlock()
 	}
 }
 
@@ -526,20 +566,11 @@ func (p *Pool) saveState() {
 	if p.state == "" {
 		return
 	}
-	type entry struct {
-		Name      string    `json:"name"`
-		ErrCount  int       `json:"err_count"`
-		CoolUntil time.Time `json:"cool_until"`
-		Disabled  bool      `json:"disabled"`
-		Reason    string    `json:"reason"`
-		LastErr   string    `json:"last_error"`
-		Balance   int64     `json:"balance"`
-		BalanceAt time.Time `json:"balance_at"`
-	}
-	out := make([]entry, 0, len(p.accounts))
-	for _, a := range p.accounts {
+	accounts := p.Accounts()
+	out := make([]stateEntry, 0, len(accounts))
+	for _, a := range accounts {
 		a.mu.Lock()
-		out = append(out, entry{
+		out = append(out, stateEntry{
 			Name:      a.Name,
 			ErrCount:  a.errCount,
 			CoolUntil: a.coolUntil,
@@ -551,10 +582,25 @@ func (p *Pool) saveState() {
 		})
 		a.mu.Unlock()
 	}
-	raw, _ := json.MarshalIndent(out, "", "  ")
-	tmp := p.state + ".tmp"
-	if err := os.WriteFile(tmp, raw, 0o600); err != nil {
+	raw, err := json.MarshalIndent(out, "", "  ")
+	if err != nil {
+		log.Printf("pool marshal state: %v", err)
 		return
 	}
-	_ = os.Rename(tmp, p.state)
+	dir := filepath.Dir(p.state)
+	if dir != "." && dir != "" {
+		if err := os.MkdirAll(dir, 0o700); err != nil {
+			log.Printf("pool create state dir: %v", err)
+			return
+		}
+	}
+	tmp := p.state + ".tmp"
+	if err := os.WriteFile(tmp, raw, 0o600); err != nil {
+		log.Printf("pool write state: %v", err)
+		return
+	}
+	if err := os.Rename(tmp, p.state); err != nil {
+		_ = os.Remove(tmp)
+		log.Printf("pool rename state: %v", err)
+	}
 }
