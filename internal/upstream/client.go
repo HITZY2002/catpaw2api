@@ -498,7 +498,7 @@ func (c *Client) FetchHistory(ctx context.Context, token, conversationID string,
 	if size <= 0 {
 		size = 50
 	}
-	path := EpChatHistory + "?page=1&pageSize=" + fmt.Sprint(size) + "&conversationId=" + url.QueryEscape(conversationID) + "&size=" + fmt.Sprint(size)
+	path := EpChatHistory + "?page=1&pageSize=50&conversationId=" + url.QueryEscape(conversationID) + "&size=" + fmt.Sprint(size)
 	headers := passportHeaders(token, "")
 	headers["Accept"] = "application/json"
 	var out map[string]any
@@ -590,9 +590,9 @@ func historyNewer(candidate historyItem, candidateIndex int, current historyItem
 	return candidateIndex > currentIndex
 }
 
-// PollAssistant 轮询 history，始终选择最新一轮 assistant，并且只在 finished=true 时返回。
-// 旧实现命中第一个 assistant 就立即返回：多轮历史按时间正序时会重复返回上一轮回复，
-// 且 finished=false 时还会把半截内容错误标记为 length 后结束轮询。
+// PollAssistant 轮询 history，始终选择当前最新一轮 assistant，并且只在 finished=true 时返回。
+// 旧实现有两类提前返回：命中第一条旧 assistant；或者最新 user 已出现但当前 assistant 尚未创建时，
+// 仍把上一轮已完成 assistant 当成当前结果。这里同时比较最新 user/assistant 的轮次与时间元数据。
 func (c *Client) PollAssistant(ctx context.Context, token, uid, conversationID string, opts PollOpts) (*AssistantResult, error) {
 	if opts.Interval <= 0 {
 		opts.Interval = 500 * time.Millisecond
@@ -634,8 +634,15 @@ func (c *Client) PollAssistant(ctx context.Context, token, uid, conversationID s
 			}
 		}
 
-		if assistant >= 0 {
-			it := data.Items[assistant]
+		// 如果最新 user 比最新 assistant 还新，说明当前轮 assistant 尚未创建；
+		// 这时必须继续轮询，不能返回上一轮已经完成的 assistant。
+		currentAssistant := assistant
+		if currentAssistant >= 0 && latestUser >= 0 && historyNewer(data.Items[latestUser], latestUser, data.Items[currentAssistant], currentAssistant) {
+			currentAssistant = -1
+		}
+
+		if currentAssistant >= 0 {
+			it := data.Items[currentAssistant]
 			if it.Status != 0 && it.Status != 1 {
 				return nil, &UpstreamError{Code: fmt.Sprintf("status_%d", it.Status), Msg: "assistant generation failed"}
 			}
