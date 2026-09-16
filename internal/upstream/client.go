@@ -41,6 +41,9 @@ func (e *ApiError) Error() string {
 type Client struct {
 	httpJSON   *http.Client
 	httpStream *http.Client
+
+	// nocodeBase nocode 域地址。生产固定为 NocodeHost；测试可指向 httptest 服务。
+	nocodeBase string
 }
 
 // New 构造客户端。timeout 同时用作 JSON 总超时与流式首字节超时。
@@ -53,6 +56,7 @@ func New(timeout time.Duration) *Client {
 	return &Client{
 		httpJSON:   &http.Client{Timeout: timeout},
 		httpStream: &http.Client{Transport: streamTransport},
+		nocodeBase: NocodeHost,
 	}
 }
 
@@ -189,6 +193,14 @@ func passportHeaders(token, uid string) map[string]string {
 }
 
 // nocodeHeaders 聊天请求头。
+// nocodeURL 返回 nocode 域地址（测试可覆盖）。
+func (c *Client) nocodeURL() string {
+	if c.nocodeBase != "" {
+		return c.nocodeBase
+	}
+	return NocodeHost
+}
+
 func nocodeHeaders(token string) map[string]string {
 	return map[string]string{
 		"access-token": token,
@@ -418,13 +430,18 @@ func (c *Client) CreateChat(ctx context.Context, token, chatID, prompt string) e
 		"techStackTemplateId": "default",
 	}
 	var out any
-	return c.doJSON(ctx, http.MethodPost, NocodeHost, EpChatCreate, nocodeHeaders(token), body, &out)
+	return c.doJSON(ctx, http.MethodPost, c.nocodeURL(), EpChatCreate, nocodeHeaders(token), body, &out)
 }
 
 // AgentStreamResp agent-stream 响应 data。
 type AgentStreamResp struct {
 	ConversationID  string `json:"conversationId"`
 	StreamMessageID string `json:"streamMessageId"`
+	// 上游把「对话创建失败」放在 data 里（HTTP 仍是 200、外层 code 仍是 0），
+	// 必须显式读取，否则只会看到 conversationId 为空、真实原因被吞掉。
+	Success      bool   `json:"success"`
+	ErrorCode    any    `json:"errorCode"`
+	ErrorMessage string `json:"errorMessage"`
 }
 
 // SendMessage 发送用户消息（nocode 流程第二步），返回 conversationId。
@@ -450,12 +467,28 @@ func (c *Client) SendMessage(ctx context.Context, token, chatID, prompt, model s
 		"isImportProject":     false,
 		"frontCreateTime":     time.Now().UnixMilli(),
 	}
-	if model != "" && model != ExactModelAuto {
-		body["model"] = model
+	// model 与 modelType 不能同时为空：auto 也必须显式发出去。
+	// 实测（2026-09-16）：两个都不发时上游返回
+	// data.success=false / "CatPaw 后端创建对话失败: model 与 modelType 不能同时为空"；
+	// 发 model:"auto" 则正常返回 conversationId。
+	if model == "" {
+		model = ExactModelAuto
 	}
+	body["model"] = model
+
 	var out AgentStreamResp
-	if err := c.doJSON(ctx, http.MethodPost, NocodeHost, EpChatAgentStream, nocodeHeaders(token), body, &out); err != nil {
+	if err := c.doJSON(ctx, http.MethodPost, c.nocodeURL(), EpChatAgentStream, nocodeHeaders(token), body, &out); err != nil {
 		return nil, err
+	}
+	if !out.Success {
+		msg := strings.TrimSpace(out.ErrorMessage)
+		if msg == "" {
+			msg = "upstream reported success=false"
+		}
+		if out.ErrorCode != nil {
+			msg = fmt.Sprintf("%v: %s", out.ErrorCode, msg)
+		}
+		return nil, &ApiError{Code: http.StatusBadGateway, Status: http.StatusBadGateway, Message: truncateStr(msg, 300), Path: EpChatAgentStream}
 	}
 	if out.ConversationID == "" {
 		return nil, fmt.Errorf("agent-stream: empty conversationId")
