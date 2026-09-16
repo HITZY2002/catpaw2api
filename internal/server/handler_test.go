@@ -87,8 +87,13 @@ func TestPlanConversationForced(t *testing.T) {
 	h.convs["x1"] = conv
 	acct := &pool.Account{Name: "a"}
 	out, isNew, prompt, err := h.planConversation(acct, req, conv, "")
-	if err != nil || isNew || out != conv || prompt != "q2" {
+	if err != nil || isNew || out == nil || prompt != "q2" {
 		t.Fatalf("out=%v isNew=%v prompt=%q err=%v", out, isNew, prompt, err)
+	}
+	// planConversation may return a private snapshot; pointer identity is not a
+	// behavioral contract. The conversation identity and routing state are.
+	if out.ConversationID != conv.ConversationID || out.ChatID != conv.ChatID || out.Account != conv.Account {
+		t.Fatalf("forced conversation identity changed: out=%+v in=%+v", out, conv)
 	}
 }
 

@@ -52,7 +52,7 @@ type Handler struct {
 	oauth *oauthStore
 
 	convMu sync.Mutex
-	convs  map[string]*convState // conversationID → 会话
+	convs  map[string]*convState // conversationID → 不可变会话快照
 	latest map[string]string     // account → 最近会话 conversationID
 }
 
@@ -61,6 +61,7 @@ type Handler struct {
 // CatPaw 续接上下文按 chatId 关联（conversationId 只用于订阅读流），
 // 无状态客户端每次全量回发历史，因此用 Absorbed+Fingerprint 记录
 // 服务端会话已吸收的消息前缀，下轮请求做指纹比对决定增量还是新会话。
+// 存入 Handler.convs 后视为不可变；读取/更新都通过 copy-on-write 快照完成。
 type convState struct {
 	ChatID         string `json:"chat_id"`
 	ConversationID string `json:"conversation_id"`
@@ -285,7 +286,10 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	var forcedConv *convState
 	if req.ConversationID != "" {
 		h.convMu.Lock()
-		forcedConv = h.convs[req.ConversationID]
+		if stored := h.convs[req.ConversationID]; stored != nil {
+			snapshot := *stored
+			forcedConv = &snapshot
+		}
 		h.convMu.Unlock()
 		if forcedConv == nil {
 			writeOpenAIError(w, http.StatusBadRequest, "unknown_conversation",
@@ -391,9 +395,13 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) planConversation(acct *pool.Account, req *chatRequest, forcedConv *convState, toolsBlock string) (conv *convState, isNew bool, prompt string, err error) {
 	h.convMu.Lock()
 	if forcedConv != nil {
-		conv = forcedConv
+		snapshot := *forcedConv
+		conv = &snapshot
 	} else if id := h.latest[acct.Name]; id != "" {
-		conv = h.convs[id]
+		if stored := h.convs[id]; stored != nil {
+			snapshot := *stored
+			conv = &snapshot
+		}
 	}
 	h.convMu.Unlock()
 
@@ -446,17 +454,20 @@ func (h *Handler) driveConversation(ctx context.Context, acct *pool.Account, con
 
 // finalizeConversation 把本轮吸收的消息（含助手回复）写入会话状态并落盘。
 // 助手回复的 tool_calls id 由本网关生成，客户端原样回发时可逐字节复算指纹。
+// 使用 copy-on-write，避免请求持有的快照被其他 goroutine 原地修改。
 func (h *Handler) finalizeConversation(acct *pool.Account, conv *convState, req *chatRequest, content string, calls []openAIToolCall) {
 	assistant := openAIMessage{Role: "assistant", Text: content, ToolCalls: calls}
 	fp := chainFingerprint(fingerprintOf(req.Messages), assistant)
 
+	next := *conv
+	next.Absorbed = len(req.Messages) + 1
+	next.Fingerprint = fp
+	next.UpdatedAt = time.Now().Unix()
+
 	h.convMu.Lock()
 	defer h.convMu.Unlock()
-	conv.Absorbed = len(req.Messages) + 1
-	conv.Fingerprint = fp
-	conv.UpdatedAt = time.Now().Unix()
-	h.convs[conv.ConversationID] = conv
-	h.latest[acct.Name] = conv.ConversationID
+	h.convs[next.ConversationID] = &next
+	h.latest[acct.Name] = next.ConversationID
 	h.evictConvsLocked()
 	h.saveConvsLocked()
 }

@@ -1,5 +1,5 @@
 {
-  "listen": ":7867",
+  "listen": "127.0.0.1:7867",
   "auth_dir": "./auths",
   "state_file": "./data/state.json",
   "default_model": "glm-5.2",
@@ -14,7 +14,9 @@
     "apply_threshold": 50,
     "apply_method": "register",
     "apply_cooldown_hours": 6,
-    "register_on_start": true
+    "register_on_start": true,
+    "auto_renew": true,
+    "renew_threshold_hours": 6
   },
   "upstream": {
     "timeout_seconds": 120

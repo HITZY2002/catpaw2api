@@ -9,10 +9,22 @@ User=ubuntu
 WorkingDirectory=/opt/catpaw2api
 EnvironmentFile=/opt/catpaw2api/.env
 ExecStart=/opt/catpaw2api/bin/catpaw2api -config /opt/catpaw2api/config.json
-Restart=always
+Restart=on-failure
 RestartSec=5
+TimeoutStopSec=10
+UMask=0077
+
 NoNewPrivileges=true
+PrivateTmp=true
 ProtectSystem=full
+ProtectHome=true
+ProtectControlGroups=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
+ProtectKernelLogs=true
+ProtectClock=true
+RestrictSUIDSGID=true
+LockPersonality=true
 ReadWritePaths=/opt/catpaw2api/auths /opt/catpaw2api/data
 
 [Install]

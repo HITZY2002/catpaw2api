@@ -2,9 +2,9 @@ package server
 
 import (
 	"context"
-	"log"
 	"encoding/json"
 	"io"
+	"log"
 	"net/http"
 	"strings"
 	"sync"
@@ -72,11 +72,26 @@ type actionResult struct {
 	Message string `json:"message,omitempty"`
 }
 
+func (h *Handler) explicitAccountMissing(uid string) bool {
+	return uid != "" && h.cfg.Pool.Get(uid) == nil
+}
+
+func writeAccountNotFound(w http.ResponseWriter, uid string) {
+	writeJSON(w, http.StatusNotFound, map[string]any{
+		"ok":      false,
+		"message": "account not found: " + uid,
+	})
+}
+
 // adminCredits 刷新积分余额。
 func (h *Handler) adminCredits(w http.ResponseWriter, r *http.Request) {
 	body, err := readUIDBody(r)
 	if err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]any{"ok": false, "message": "bad json: " + err.Error()})
+		return
+	}
+	if h.explicitAccountMissing(body.UID) {
+		writeAccountNotFound(w, body.UID)
 		return
 	}
 	log.Printf("adminCredits body.UID=%q", body.UID)
@@ -112,6 +127,10 @@ func (h *Handler) adminApply(w http.ResponseWriter, r *http.Request) {
 	body, err := readUIDBody(r)
 	if err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]any{"ok": false, "message": "bad json: " + err.Error()})
+		return
+	}
+	if h.explicitAccountMissing(body.UID) {
+		writeAccountNotFound(w, body.UID)
 		return
 	}
 	method := "register"
@@ -197,7 +216,13 @@ func (h *Handler) adminEnable(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]any{"ok": false, "message": "uid required"})
 		return
 	}
-	h.cfg.Pool.Enable(body.UID, 0)
+	balance, ok := h.cachedBalance(body.UID)
+	if !ok {
+		writeAccountNotFound(w, body.UID)
+		return
+	}
+	// 启用账号只改变可用状态，不能把真实积分余额重置为 0。
+	h.cfg.Pool.Enable(body.UID, balance)
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "message": "已启用 " + body.UID})
 }
 
@@ -205,6 +230,10 @@ func (h *Handler) adminDisable(w http.ResponseWriter, r *http.Request) {
 	body, err := readUIDBody(r)
 	if err != nil || body.UID == "" {
 		writeJSON(w, http.StatusBadRequest, map[string]any{"ok": false, "message": "uid required"})
+		return
+	}
+	if h.explicitAccountMissing(body.UID) {
+		writeAccountNotFound(w, body.UID)
 		return
 	}
 	reason := body.Reason
@@ -221,6 +250,10 @@ func (h *Handler) adminClearCooldown(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]any{"ok": false, "message": "uid required"})
 		return
 	}
+	if h.explicitAccountMissing(body.UID) {
+		writeAccountNotFound(w, body.UID)
+		return
+	}
 	h.cfg.Pool.ClearCooldown(body.UID)
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "message": "已清冷却 " + body.UID})
 }
@@ -231,8 +264,32 @@ func (h *Handler) adminUnfreeze(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]any{"ok": false, "message": "uid required"})
 		return
 	}
+	if h.explicitAccountMissing(body.UID) {
+		writeAccountNotFound(w, body.UID)
+		return
+	}
 	h.cfg.Pool.Unfreeze(body.UID)
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "message": "已强制解冻 " + body.UID})
+}
+
+func (h *Handler) cachedBalance(uid string) (int64, bool) {
+	for _, st := range h.cfg.Pool.List() {
+		u, _ := st["uid"].(string)
+		if u != uid {
+			continue
+		}
+		switch v := st["balance"].(type) {
+		case int64:
+			return v, true
+		case int:
+			return int64(v), true
+		case float64:
+			return int64(v), true
+		default:
+			return 0, true
+		}
+	}
+	return 0, false
 }
 
 func (h *Handler) pickTargets(uid string) []string {

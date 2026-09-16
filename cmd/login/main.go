@@ -4,7 +4,7 @@
 //  1. 本地起 127.0.0.1 回调服务
 //  2. GET /api/gateway/passport/login-config → loginEntryUrl
 //  3. 拼接 state/redirect/sid 打开浏览器
-//  4. 回调带 token 或轮询 /api/gateway/passport/poll-token?sid=
+//  4. 回调带 token+state 或轮询 /api/gateway/passport/poll-token?sid=
 //  5. GET /api/gateway/passport/current-user → uid → 落盘
 package main
 
@@ -55,7 +55,6 @@ func main() {
 		port := ln.Addr().(*net.TCPAddr).Port
 		callback = fmt.Sprintf("http://127.0.0.1:%d/callback", port)
 		tokenCh = make(chan string, 1)
-		go serveCallback(ln, tokenCh)
 		defer ln.Close()
 	}
 
@@ -68,6 +67,9 @@ func main() {
 
 	state := randHex(16)
 	sid := randHex(16)
+	if ln != nil {
+		go serveCallback(ln, state, tokenCh)
+	}
 	u, err := url.Parse(loginEntry)
 	if err != nil {
 		log.Fatalf("parse loginEntryUrl: %v", err)
@@ -93,7 +95,7 @@ func main() {
 
 	// 4. 回调 vs 轮询双通道（print-only 只有轮询）
 	if !*printOnly {
-		token, err = waitToken(ctx, client, sid, tokenCh, state)
+		token, err = waitToken(ctx, client, sid, tokenCh)
 	} else {
 		token, err = waitPoll(ctx, client, sid)
 	}
@@ -106,6 +108,9 @@ func main() {
 	if err != nil {
 		log.Fatalf("fetch current-user: %v", err)
 	}
+	if user == nil || user.UserID == "" {
+		log.Fatalf("fetch current-user: empty user id")
+	}
 	a := auth.New(user.UserID, user.UserName, token)
 	if err := auth.SaveNew(*authDir, a); err != nil {
 		log.Fatalf("save auth: %v", err)
@@ -115,30 +120,57 @@ func main() {
 	fmt.Println("提示：个人版 token 有效期约 72h，到期后重新运行本工具登录。")
 }
 
-// serveCallback 处理网关回调（POST 表单/JSON，兼容 GET query）。
-func serveCallback(ln net.Listener, ch chan<- string) {
+// serveCallback 处理网关回调。expectedState 必须与授权请求生成的 state 完全一致，
+// 防止本地回调被其它页面/进程注入不属于本次登录会话的 token。
+func serveCallback(ln net.Listener, expectedState string, ch chan<- string) {
+	_ = http.Serve(ln, callbackHandler(expectedState, ch))
+}
+
+func callbackHandler(expectedState string, ch chan<- string) http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/callback", func(w http.ResponseWriter, r *http.Request) {
-		var token string
+		var token, state string
 		switch r.Method {
 		case http.MethodGet:
 			token = r.URL.Query().Get("token")
+			state = r.URL.Query().Get("state")
 		case http.MethodPost:
-			body, _ := io.ReadAll(io.LimitReader(r.Body, 64*1024))
+			body, err := io.ReadAll(io.LimitReader(r.Body, 64*1024))
+			if err != nil {
+				http.Error(w, "读取回调失败", http.StatusBadRequest)
+				return
+			}
 			ct := r.Header.Get("Content-Type")
 			if strings.Contains(ct, "application/json") {
 				var p struct {
 					Token string `json:"token"`
 					State string `json:"state"`
 				}
-				_ = json.Unmarshal(body, &p)
-				token = p.Token
+				if err := json.Unmarshal(body, &p); err != nil {
+					http.Error(w, "回调 JSON 无效", http.StatusBadRequest)
+					return
+				}
+				token, state = p.Token, p.State
 			} else {
-				vals, _ := url.ParseQuery(string(body))
-				token = vals.Get("token")
+				vals, err := url.ParseQuery(string(body))
+				if err != nil {
+					http.Error(w, "回调表单无效", http.StatusBadRequest)
+					return
+				}
+				token, state = vals.Get("token"), vals.Get("state")
 			}
+		default:
+			w.Header().Set("Allow", "GET, POST")
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
 		}
+
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		if expectedState == "" || state == "" || state != expectedState {
+			w.WriteHeader(http.StatusBadRequest)
+			_, _ = w.Write([]byte("<h3>登录失败：state 校验失败，请重新发起登录。</h3>"))
+			return
+		}
 		if token == "" {
 			w.WriteHeader(http.StatusBadRequest)
 			_, _ = w.Write([]byte("<h3>登录失败：缺少 token</h3>"))
@@ -150,16 +182,18 @@ func serveCallback(ln net.Listener, ch chan<- string) {
 		default:
 		}
 	})
-	_ = http.Serve(ln, mux)
+	return mux
 }
 
-func waitToken(ctx context.Context, client *upstream.Client, sid string, ch chan string, state string) (string, error) {
+func waitToken(ctx context.Context, client *upstream.Client, sid string, ch chan string) (string, error) {
 	timer := time.NewTimer(5 * time.Minute)
 	defer timer.Stop()
 	ticker := time.NewTicker(time.Second)
 	defer ticker.Stop()
 	for {
 		select {
+		case <-ctx.Done():
+			return "", ctx.Err()
 		case <-timer.C:
 			return "", fmt.Errorf("登录超时（5 分钟）")
 		case tok := <-ch:
@@ -181,6 +215,8 @@ func waitPoll(ctx context.Context, client *upstream.Client, sid string) (string,
 	defer ticker.Stop()
 	for {
 		select {
+		case <-ctx.Done():
+			return "", ctx.Err()
 		case <-timer.C:
 			return "", fmt.Errorf("登录超时（5 分钟）")
 		case <-ticker.C:

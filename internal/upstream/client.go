@@ -37,7 +37,7 @@ func (e *ApiError) Error() string {
 // 内部拆两个 http.Client：
 //   - httpJSON ：REST/JSON 请求，带总超时（默认 120s）
 //   - httpStream：SSE 流式请求，无总超时（长回复不被截断），
-//     仅靠 Transport.ResponseHeaderTimeout 做首字节厲底（与 traework2api 一致）
+//     仅靠 Transport.ResponseHeaderTimeout 做首字节兜底（与 traework2api 一致）
 type Client struct {
 	httpJSON   *http.Client
 	httpStream *http.Client
@@ -61,8 +61,8 @@ func New(timeout time.Duration) *Client {
 //   - 直连 ai.catpaw.meituan.com / 聊天 nocode.cn：{unifyCode, code, msg, data, success}
 //     （success=true 视为成功；失败时 msg 是错误文案）
 //
-// 优先按 success 字段判定（直连/聊天），否则回退 code 字段（网关）。
-// 某些端点（credit web）直接返回 data 对象，这里兼容三种形态。
+// 任何 HTTP >=400 必须先被视为错误；即使 body 恰好能被解成调用方期望的结构，
+// 也不能绕过 transport status。随后才按 success/code 解释 2xx/3xx 的业务信封。
 func (c *Client) doJSON(ctx context.Context, method, baseURL, path string, headers map[string]string, body any, out any) error {
 	var rd io.Reader
 	if body != nil {
@@ -87,7 +87,10 @@ func (c *Client) doJSON(ctx context.Context, method, baseURL, path string, heade
 		return err
 	}
 	defer resp.Body.Close()
-	raw, _ := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
+	raw, err := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
+	if err != nil {
+		return fmt.Errorf("read upstream response %s: %w", path, err)
+	}
 
 	// 统一信封解析：success 字段存在 → 直连/聊天信封；否则按网关 code 字段。
 	var envelope struct {
@@ -95,54 +98,71 @@ func (c *Client) doJSON(ctx context.Context, method, baseURL, path string, heade
 		UnifyCode int             `json:"unifyCode"`
 		Message   string          `json:"message"` // 网关错误文案
 		Msg       string          `json:"msg"`     // 直连/聊天错误文案
-		Success   *bool           `json:"success"` // 直连/聊天成功标志（指针区分「未出现」与 false）
+		Success   *bool           `json:"success"` // 指针区分“未出现”与 false
 		Data      json.RawMessage `json:"data"`
 	}
 	_ = json.Unmarshal(raw, &envelope)
 
-	// 优先按 success 判定（直连/聊天信封）。
+	apiError := func(defaultCode int) *ApiError {
+		code := envelope.Code
+		if code == 0 {
+			code = envelope.UnifyCode
+		}
+		if code == 0 {
+			code = defaultCode
+		}
+		msg := envelope.Msg
+		if msg == "" {
+			msg = envelope.Message
+		}
+		if msg == "" {
+			msg = truncateStr(string(raw), 200)
+		}
+		if msg == "" {
+			msg = http.StatusText(resp.StatusCode)
+		}
+		return &ApiError{Code: code, Status: resp.StatusCode, Message: msg, Path: path}
+	}
+
+	// Transport status 是不可绕过的第一层门禁。旧实现把这段放在 raw fallback 之后，
+	// 导致某些 4xx/5xx JSON 在成功 Unmarshal 后直接 return nil。
+	if resp.StatusCode >= http.StatusBadRequest {
+		return apiError(resp.StatusCode)
+	}
+
+	// 直连/聊天信封。
 	if envelope.Success != nil {
 		if !*envelope.Success {
-			msg := envelope.Msg
-			if msg == "" {
-				msg = envelope.Message
-			}
-			if msg == "" {
-				msg = "upstream error"
-			}
-			return &ApiError{Code: envelope.Code, Status: resp.StatusCode, Message: msg, Path: path}
+			return apiError(envelope.Code)
 		}
-		// success=true：解 data；data 为空（如某些 ack 响应）直接返回 nil。
-		if out != nil && len(envelope.Data) > 0 {
-			return json.Unmarshal(envelope.Data, out)
+		if out != nil && len(envelope.Data) > 0 && string(envelope.Data) != "null" {
+			if err := json.Unmarshal(envelope.Data, out); err != nil {
+				return fmt.Errorf("decode upstream data %s: %w", path, err)
+			}
 		}
 		return nil
 	}
 
-	// 网关信封：code!=0 且 data 为空视为错误（注意 data 与 code 都为 0 的空 ack）。
+	// 网关信封：非 0/200 code 是业务错误。
 	if envelope.Code != 0 && envelope.Code != 200 {
-		msg := envelope.Message
-		if msg == "" {
-			msg = envelope.Msg
-		}
-		return &ApiError{Code: envelope.Code, Status: resp.StatusCode, Message: msg, Path: path}
+		return apiError(envelope.Code)
 	}
-	// 网关 code=0 或裸 data 响应。
-	if out != nil && len(envelope.Data) > 0 {
-		return json.Unmarshal(envelope.Data, out)
+	if out == nil {
+		return nil
 	}
-	if out != nil && len(envelope.Data) == 0 && envelope.Code == 0 && envelope.Success == nil {
-		// 可能是 credit web 裸 data 对象：整体当作 data 解析。
-		if json.Unmarshal(raw, out) == nil {
-			return nil
+	if len(envelope.Data) > 0 && string(envelope.Data) != "null" {
+		if err := json.Unmarshal(envelope.Data, out); err != nil {
+			return fmt.Errorf("decode upstream data %s: %w", path, err)
 		}
 		return nil
 	}
-	if resp.StatusCode >= 400 {
-		return &ApiError{Code: resp.StatusCode, Status: resp.StatusCode, Message: truncateStr(string(raw), 200), Path: path}
+
+	// 某些 credit web 端点没有统一信封，直接返回目标对象。
+	if len(raw) == 0 {
+		return nil
 	}
-	if out != nil {
-		return json.Unmarshal(raw, out)
+	if err := json.Unmarshal(raw, out); err != nil {
+		return fmt.Errorf("decode upstream response %s: %w", path, err)
 	}
 	return nil
 }
@@ -205,7 +225,7 @@ func (c *Client) PollToken(ctx context.Context, sid string) (string, error) {
 	return token, nil
 }
 
-// Ping 校验 token：网关 401/403 视为失效。
+// Ping 校验 token：只有 401/403 表示凭证确定失效；5xx/网络错误属于临时故障。
 func (c *Client) Ping(ctx context.Context, token string) (bool, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, GatewayHost+EpAuthPing, nil)
 	if err != nil {
@@ -217,8 +237,22 @@ func (c *Client) Ping(ctx context.Context, token string) (bool, error) {
 		return false, err
 	}
 	defer resp.Body.Close()
-	io.Copy(io.Discard, io.LimitReader(resp.Body, 1<<20))
-	return resp.StatusCode != http.StatusUnauthorized && resp.StatusCode != http.StatusForbidden, nil
+	raw, readErr := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if readErr != nil {
+		return false, readErr
+	}
+	switch {
+	case resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden:
+		return false, nil
+	case resp.StatusCode >= 200 && resp.StatusCode < 400:
+		return true, nil
+	default:
+		msg := truncateStr(string(raw), 200)
+		if msg == "" {
+			msg = http.StatusText(resp.StatusCode)
+		}
+		return false, &ApiError{Code: resp.StatusCode, Status: resp.StatusCode, Message: msg, Path: EpAuthPing}
+	}
 }
 
 // UserInfo 当前登录用户。
@@ -305,7 +339,6 @@ func ParseCredits(balance map[string]any) int64 {
 		n, _ := v.Int64()
 		return n
 	case string:
-		// Handle string balance like "1200.00"
 		f, err := strconv.ParseFloat(v, 64)
 		if err != nil {
 			return 0
@@ -335,7 +368,7 @@ func (c *Client) CampaignInit(ctx context.Context, token string) (map[string]any
 
 // ModelInfo 模型信息（来自 /api/agent/maas/model-types 的 data 项）。
 type ModelInfo struct {
-	ModelTypeName   string `json:"modelTypeName"`   // 真实模型 id（chat 请求里 model 字段用这个）
+	ModelTypeName   string `json:"modelTypeName"`
 	CatPawModelType string `json:"catPawModelType"`
 	Description     string `json:"description"`
 	SupportImage    bool   `json:"supportImage"`
@@ -352,10 +385,6 @@ type ModelInfo struct {
 func (m ModelInfo) ID() string { return m.ModelTypeName }
 
 // FetchModels 拉取模型表 POST /api/agent/maas/model-types。
-//
-// 上游入参 ModelTypeQueryReqVO 必填 tenant + scene + env（逆向自 app.asar：
-// fetchModelTypes 调 A("/api/agent/maas/model-types", {tenant:"CatDesk", scene:"CATX_APP", env:"EXTERNAL"})）。
-// 返回空列表不视为错误（由调用方决定是否走兜底表）。
 func (c *Client) FetchModels(ctx context.Context, token, uid string) ([]ModelInfo, error) {
 	headers := passportHeaders(token, uid)
 	headers["Accept"] = "application/json"
@@ -469,7 +498,7 @@ func (c *Client) FetchHistory(ctx context.Context, token, conversationID string,
 	if size <= 0 {
 		size = 50
 	}
-	path := EpChatHistory + "?page=1&pageSize=" + fmt.Sprint(size) + "&conversationId=" + url.QueryEscape(conversationID) + "&size=" + fmt.Sprint(size)
+	path := EpChatHistory + "?page=1&pageSize=50&conversationId=" + url.QueryEscape(conversationID) + "&size=" + fmt.Sprint(size)
 	headers := passportHeaders(token, "")
 	headers["Accept"] = "application/json"
 	var out map[string]any
@@ -491,18 +520,79 @@ type PollOpts struct {
 
 // AssistantResult 一轮对话的完整结果。
 type AssistantResult struct {
-	Content   string         // assistant 文本（content[].type==text 拼接）
-	Reasoning string         // reasoning 文本（若有；free 计划无）
-	Usage     map[string]any // 来自 user 消息的 totalUsage（prompt/completion/total tokens）
-	Finish    string         // stop / length / error
-	ErrCode   string         // 上游业务错误码（Finish==error 时有值）
+	Content   string
+	Reasoning string
+	Usage     map[string]any
+	Finish    string
+	ErrCode   string
 }
 
-// PollAssistant 轮询 history 直到 assistant 消息出现且 finished=true，或超时/出错。
-//
-// 流程：SendMessage 返回 conversationId 后，上游异步生成回复；
-// free 计划的 /api/agent/stream/connect SSE 通道不吐数据（推送走 Pike WebSocket），
-// 因此纯 HTTP 代理改为轮询 GET /api/agent/conversation/history 拿完整回复。
+type historyContent struct {
+	Type      string `json:"type"`
+	Text      string `json:"text"`
+	Reasoning string `json:"reasoning"`
+}
+
+type historyItem struct {
+	Type       string           `json:"type"`
+	Status     int              `json:"status"`
+	Finished   bool             `json:"finished"`
+	RoundID    any              `json:"roundId"`
+	CreateTime any              `json:"createTime"`
+	Content    []historyContent `json:"content"`
+	TotalUsage map[string]any   `json:"totalUsage"`
+}
+
+func historyRound(v any) (float64, bool) {
+	switch n := v.(type) {
+	case float64:
+		return n, true
+	case int:
+		return float64(n), true
+	case int64:
+		return float64(n), true
+	case json.Number:
+		f, err := n.Float64()
+		return f, err == nil
+	case string:
+		f, err := strconv.ParseFloat(strings.TrimSpace(n), 64)
+		return f, err == nil
+	default:
+		return 0, false
+	}
+}
+
+func historyTime(v any) (time.Time, bool) {
+	s, ok := v.(string)
+	if !ok || strings.TrimSpace(s) == "" {
+		return time.Time{}, false
+	}
+	for _, layout := range []string{time.RFC3339Nano, time.RFC3339} {
+		if t, err := time.Parse(layout, s); err == nil {
+			return t, true
+		}
+	}
+	return time.Time{}, false
+}
+
+// historyNewer 尽量使用上游 roundId/createTime 判断新旧；元数据缺失时退回数组顺序。
+func historyNewer(candidate historyItem, candidateIndex int, current historyItem, currentIndex int) bool {
+	if cr, ok := historyRound(candidate.RoundID); ok {
+		if rr, rok := historyRound(current.RoundID); rok && cr != rr {
+			return cr > rr
+		}
+	}
+	if ct, ok := historyTime(candidate.CreateTime); ok {
+		if rt, rok := historyTime(current.CreateTime); rok && !ct.Equal(rt) {
+			return ct.After(rt)
+		}
+	}
+	return candidateIndex > currentIndex
+}
+
+// PollAssistant 轮询 history，始终选择当前最新一轮 assistant，并且只在 finished=true 时返回。
+// 旧实现有两类提前返回：命中第一条旧 assistant；或者最新 user 已出现但当前 assistant 尚未创建时，
+// 仍把上一轮已完成 assistant 当成当前结果。这里同时比较最新 user/assistant 的轮次与时间元数据。
 func (c *Client) PollAssistant(ctx context.Context, token, uid, conversationID string, opts PollOpts) (*AssistantResult, error) {
 	if opts.Interval <= 0 {
 		opts.Interval = 500 * time.Millisecond
@@ -522,64 +612,66 @@ func (c *Client) PollAssistant(ctx context.Context, token, uid, conversationID s
 	var attempt int
 	for {
 		attempt++
-		// out 只解 envelope.data（doJSON 已剥外层信封）。
 		var data struct {
-			Items []struct {
-				Type      string `json:"type"`
-				Status    int    `json:"status"`
-				Finished  bool   `json:"finished"`
-				Content []struct {
-					Type     string `json:"type"`
-					Text     string `json:"text"`
-					Reasoning string `json:"reasoning"`
-				} `json:"content"`
-				TotalUsage map[string]any `json:"totalUsage"`
-			} `json:"items"`
+			Items []historyItem `json:"items"`
 		}
 		if err := c.doJSON(ctx, http.MethodGet, DirectHost, path, headers, nil, &data); err != nil {
 			return nil, err
 		}
-		// 找 assistant 消息：finished=true 即完整回复；status!=1 视为生成失败。
-		var assistant = -1
-		var userUsage map[string]any
+
+		assistant := -1
+		latestUser := -1
 		for i, it := range data.Items {
-			if it.Type == "user" && it.TotalUsage != nil {
-				userUsage = it.TotalUsage
-			}
-			if it.Type == "assistant" {
-				assistant = i
-				break
+			switch it.Type {
+			case "assistant":
+				if assistant < 0 || historyNewer(it, i, data.Items[assistant], assistant) {
+					assistant = i
+				}
+			case "user":
+				if latestUser < 0 || historyNewer(it, i, data.Items[latestUser], latestUser) {
+					latestUser = i
+				}
 			}
 		}
-		if assistant >= 0 {
-			it := data.Items[assistant]
+
+		// 如果最新 user 比最新 assistant 还新，说明当前轮 assistant 尚未创建；
+		// 这时必须继续轮询，不能返回上一轮已经完成的 assistant。
+		currentAssistant := assistant
+		if currentAssistant >= 0 && latestUser >= 0 && historyNewer(data.Items[latestUser], latestUser, data.Items[currentAssistant], currentAssistant) {
+			currentAssistant = -1
+		}
+
+		if currentAssistant >= 0 {
+			it := data.Items[currentAssistant]
 			if it.Status != 0 && it.Status != 1 {
 				return nil, &UpstreamError{Code: fmt.Sprintf("status_%d", it.Status), Msg: "assistant generation failed"}
 			}
-			var sb strings.Builder
-			var rb strings.Builder
-			for _, c := range it.Content {
-				switch c.Type {
-				case "text":
-					sb.WriteString(c.Text)
-				case "reasoning":
-					if c.Reasoning != "" {
-						rb.WriteString(c.Reasoning)
-					} else {
-						rb.WriteString(c.Text)
+			if it.Finished {
+				var sb strings.Builder
+				var rb strings.Builder
+				for _, c := range it.Content {
+					switch c.Type {
+					case "text":
+						sb.WriteString(c.Text)
+					case "reasoning":
+						if c.Reasoning != "" {
+							rb.WriteString(c.Reasoning)
+						} else {
+							rb.WriteString(c.Text)
+						}
 					}
 				}
+				var userUsage map[string]any
+				if latestUser >= 0 {
+					userUsage = data.Items[latestUser].TotalUsage
+				}
+				return &AssistantResult{
+					Content:   sb.String(),
+					Reasoning: rb.String(),
+					Usage:     userUsage,
+					Finish:    "stop",
+				}, nil
 			}
-			finish := "stop"
-			if !it.Finished {
-				finish = "length"
-			}
-			return &AssistantResult{
-				Content:   sb.String(),
-				Reasoning: rb.String(),
-				Usage:     userUsage,
-				Finish:    finish,
-			}, nil
 		}
 		if time.Now().After(deadline) {
 			return nil, fmt.Errorf("poll assistant timeout after %s (%d attempts, conv=%s)", opts.Timeout, attempt, conversationID)

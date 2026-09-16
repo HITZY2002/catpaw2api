@@ -32,7 +32,7 @@ func main() {
 	}
 	log.Printf("loaded %d account(s) from %s", len(auths), cfg.AuthDir)
 	if len(auths) == 0 {
-		log.Printf("WARNING: no accounts found. Run `catpaw2api login` first.")
+		log.Printf("WARNING: no accounts found. Run `catpaw2api-login` first.")
 	}
 
 	if cfg.StateFile != "" {
@@ -62,6 +62,10 @@ func main() {
 		AuthDir:         cfg.AuthDir,
 	})
 
+	convStateFile := ""
+	if cfg.StateFile != "" {
+		convStateFile = cfg.StateFile + ".conv.json"
+	}
 	h := server.NewHandler(server.Config{
 		Pool:          p,
 		APIKey:        cfg.APIKey,
@@ -71,7 +75,7 @@ func main() {
 		ErrThreshold:  cfg.Cooldown.ErrThresh,
 		ErrCooldown:   cfg.ErrCooldownDur,
 		DefaultModel:  cfg.DefaultModel,
-		ConvStateFile: cfg.StateFile + ".conv.json",
+		ConvStateFile: convStateFile,
 		QuotaInfo: map[string]any{
 			"enabled":               cfg.Quota.Enabled,
 			"poll_minutes":          cfg.Quota.PollMinutes,
@@ -99,16 +103,20 @@ func main() {
 	srv := &http.Server{
 		Addr:              cfg.Listen,
 		Handler:           h,
-		ReadHeaderTimeout: 30 * time.Second,
+		ReadHeaderTimeout: 10 * time.Second,
+		IdleTimeout:       90 * time.Second,
+		MaxHeaderBytes:    1 << 20,
 	}
 	go func() {
 		<-ctx.Done()
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
-		_ = srv.Shutdown(shutdownCtx)
+		if err := srv.Shutdown(shutdownCtx); err != nil {
+			log.Printf("http shutdown: %v", err)
+		}
 	}()
 
-	log.Printf("catpaw2api listening on %s (api_key=%v)", cfg.Listen, cfg.APIKey != "")
+	log.Printf("catpaw2api listening on %s (authentication enabled)", cfg.Listen)
 	if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 		log.Fatalf("http: %v", err)
 	}
